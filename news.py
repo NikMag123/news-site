@@ -35,7 +35,8 @@ def fetch_rss(url):
         title_text = title.text if title is not None else ""
         desc_text = desc.text if desc is not None else ""
         combined = (title_text + " " + desc_text).lower()
-        if any(kw in combined for kw in KEYWORDS):
+        matches = sum(1 for kw in KEYWORDS if kw in combined)
+        if matches >= 2:
             results.append(title_text)
     return results
 
