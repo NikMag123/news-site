@@ -8,7 +8,7 @@ from openai import OpenAI
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 GH_TOKEN = os.environ["GH_TOKEN"]
 REPO = "NikMag123/news-site"
-MAX_NEWS_ON_SITE = 10  # сколько новостей хранить на сайте
+MAX_NEWS_ON_SITE = 50  # сколько новостей хранить на сайте
 
 KEYWORDS = [
     "недвижимость", "квартира", "комната", "дом", "коттедж",
