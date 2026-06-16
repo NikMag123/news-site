@@ -3,17 +3,25 @@ import json
 import base64
 import requests
 import xml.etree.ElementTree as ET
-from openai import OpenAI
+from html import unescape
 from datetime import datetime
+from openai import OpenAI
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-GH_TOKEN = os.environ["GH_TOKEN"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GH_TOKEN = os.getenv("GH_TOKEN")
 REPO = "NikMag123/news-site"
-
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_NEWS_ON_SITE = 50
+MIN_SCORE = 5
 
-KEYWORDS = [
+if not OPENAI_API_KEY:
+    raise SystemExit("OPENAI_API_KEY is missing")
+if not GH_TOKEN:
+    raise SystemExit("GH_TOKEN is missing")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+TOPIC_KEYWORDS = [
     "недвижимость", "квартира", "дом", "жилье",
     "земля", "участок", "кадастр", "ипотека",
     "аренда", "собственность", "строительство",
@@ -25,85 +33,97 @@ KEYWORDS = [
     "долевое строительство"
 ]
 
-REAL_ESTATE_HINTS = [
-    "недвижим", "квартир", "дом", "жиль", "земл", "участ",
-    "ипотек", "аренд", "собствен", "строител", "застрой",
-    "жкх", "капремонт", "кадастр", "росреестр", "долев"
-]
-
-# Разрешенные регионы
-ALLOWED_REGIONS = [
+GEO_ALLOWED = [
     "краснодар",
     "сочи",
     "кубан",
     "краснодарский край"
 ]
 
-# Нежелательные регионы
-BLOCKED_REGIONS = [
-    "алтай",
-    "карел",
-    "буряти",
-    "удмурт",
-    "якут",
-    "чуваш",
-    "татарстан",
-    "омск",
-    "новосибирск",
-    "дагестан",
-    "челябинск",
-    "хакаси",
-    "иркут"
+DOC_KEYWORDS = [
+    "федеральный закон",
+    "постановление правительства",
+    "постановление",
+    "приказ",
+    "распоряжение",
+    "пленум",
+    "верховный суд",
+    "конституционный суд",
+    "обзор судебной практики",
+    "разъяснение",
+    "решение суда",
+    "определение суда",
+    "кадастровой стоимости",
+    "росреестр",
+    "минстрой",
+    "минэкономразвития"
 ]
 
-# Нежелательные темы, которые часто дают слабую связь с недвижимостью
-BLOCKED_TOPICS = [
-    "ветеринар",
-    "животн",
-    "сельхоз",
-    "спорт",
-    "культура",
-    "туризм",
-    "образован",
-    "здравоохран",
-    "медицин",
-    "погода",
-    "конкурс",
-    "фестиваль",
-    "экология",
-    "благоустройств",
-    "дорожн",
-    "транспорт",
+IRRELEVANT_HINTS = [
+    "спорт", "культура", "кино", "театр", "концерт",
+    "погода", "туризм", "школ", "образован", "медицин",
+    "авар", "пожар", "кримин", "полици", "шоу",
+    "гастр", "праздник", "фестиваль", "ремонт дорог"
 ]
 
-def is_relevant(combined_text):
-    text = combined_text.lower()
+def clean_text(s):
+    return " ".join(unescape((s or "")).split()).strip()
 
-    # Сразу отсекаем ненужные регионы
-    if any(region in text for region in BLOCKED_REGIONS):
-        return False
+def has_any(text, words):
+    return any(w in text for w in words)
 
-    # Сразу отсекаем слабосвязанные темы
-    if any(topic in text for topic in BLOCKED_TOPICS):
-        return False
+def score_item(title, desc, source_type):
+    text = (title + " " + desc).lower()
+    score = 0
+    reasons = []
 
-    hint_matches = sum(1 for kw in REAL_ESTATE_HINTS if kw in text)
+    topic_hits = sum(1 for kw in TOPIC_KEYWORDS if kw in text)
+    if topic_hits:
+        score += min(6, topic_hits * 2)
+        reasons.append(f"topics:{topic_hits}")
 
-    # Для Краснодарского края и Сочи допускаем чуть мягче
-    if any(region in text for region in ALLOWED_REGIONS):
-        return hint_matches >= 1
+    geo_hits = sum(1 for kw in GEO_ALLOWED if kw in text)
+    if geo_hits:
+        score += 3
+        reasons.append("geo")
 
-    # Для остальных регионов только более плотная связь с недвижимостью
-    return hint_matches >= 2
+    doc_hits = sum(1 for kw in DOC_KEYWORDS if kw in text)
+    if doc_hits:
+        score += min(4, doc_hits)
+        reasons.append(f"docs:{doc_hits}")
 
+    if source_type == "law":
+        score += 2
+        reasons.append("source:law")
+    else:
+        score += 1
+        reasons.append("source:news")
 
-def fetch_rss(url):
+    if has_any(text, ["верховн", "пленум", "судебн", "обзор практик", "разъяснен", "определен", "решени"]):
+        score += 2
+        reasons.append("court")
+
+    if has_any(text, ["федеральный закон", "постановлен", "приказ", "распоряжен", "указ"]):
+        score += 1
+        reasons.append("legal_doc")
+
+    if has_any(text, IRRELEVANT_HINTS):
+        score -= 3
+        reasons.append("irrelevant")
+
+    if len(text) < 40:
+        score -= 2
+        reasons.append("short")
+
+    return score, reasons
+
+def fetch_rss(url, source_type):
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
         root = ET.fromstring(response.content)
     except Exception as e:
-        print(f"Ошибка загрузки {url}: {e}")
+        print(f"Ошибка загрузки {url}: {e}", flush=True)
         return []
 
     results = []
@@ -112,68 +132,63 @@ def fetch_rss(url):
         title = item.find("title")
         desc = item.find("description")
 
-        title_text = title.text if title is not None and title.text else ""
-        desc_text = desc.text if desc is not None and desc.text else ""
+        title_text = clean_text(title.text if title is not None else "")
+        desc_text = clean_text(desc.text if desc is not None else "")
 
-        combined = (title_text + " " + desc_text).lower()
+        if not title_text:
+            continue
 
-        if is_relevant(combined):
-            results.append({
-                "title": title_text,
-                "description": desc_text
-            })
+        score, reasons = score_item(title_text, desc_text, source_type)
+
+        results.append({
+            "title": title_text,
+            "description": desc_text,
+            "source_type": source_type,
+            "score": score,
+            "reasons": reasons
+        })
 
     return results
 
-
 def get_existing_news():
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
-
     headers = {
-        "Authorization": f"token {GH_TOKEN}",
+        "Authorization": f"Bearer {GH_TOKEN}",
         "Accept": "application/vnd.github+json"
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-
+        resp = requests.get(url, headers=headers, timeout=20)
         if resp.status_code != 200:
             return [], ""
 
         data = resp.json()
-
         if "content" in data:
             content = base64.b64decode(data["content"]).decode("utf-8")
             return json.loads(content), data.get("sha", "")
-
     except Exception as e:
-        print(f"Ошибка чтения news.json: {e}")
+        print(f"Ошибка чтения news.json: {e}", flush=True)
 
     return [], ""
 
-
-def rewrite_one(item, source_type):
+def rewrite_one(item):
+    source_type = item["source_type"]
     prompt = f"""
-Ты — юрист-копирайтер для сайта юриста по недвижимости в Сочи.
+Ты пишешь аккуратный юридический рерайт для сайта юриста по недвижимости.
 
 Исходный материал:
-Заголовок: {item['title']}
-Описание: {item.get('description', '')}
+Заголовок: {item["title"]}
+Описание: {item.get("description", "")}
 
-ВАЖНО:
-1. Не усиливай тему искусственно.
-2. Если материал не имеет прямой связи с недвижимостью, землей, ипотекой, кадастром, собственностью, арендой, строительством или ЖКХ для собственников, не делай натянутую юридическую статью.
-3. Не используй новости про ветеринарию, культуру, спорт, туризм, медицину, образование, погоду и похожие темы.
-4. Особенно важны:
-- Краснодарский край
-- Сочи
-- федеральные законы
-- реальные изменения для собственников, покупателей, арендаторов, застройщиков
+Правила:
+1. Не выдумывай факты.
+2. Не добавляй Сочи, Краснодарский край или любой другой регион, если этого нет в исходнике.
+3. Не делай вид, что новость точно про недвижимость, если это не видно из текста.
+4. Если новость федеральная, сохрани федеральный смысл.
+5. Если материал слабый, все равно сделай корректный, нейтральный, полезный пересказ.
+6. Верни только JSON без markdown и без пояснений.
 
-Напиши полезную статью для сайта юриста.
-
-Ответ СТРОГО JSON:
-
+Формат ответа строго такой:
 {{
   "title": "...",
   "text": "..."
@@ -182,49 +197,58 @@ def rewrite_one(item, source_type):
 
     try:
         result = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL,
             messages=[
+                {
+                    "role": "system",
+                    "content": "Ты аккуратный юридический редактор. Возвращай только JSON."
+                },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            max_tokens=1800
+            temperature=0.2,
+            max_tokens=1200,
+            response_format={"type": "json_object"}
         )
 
         raw = result.choices[0].message.content.strip()
-
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-
-        if raw.endswith("```"):
-            raw = raw.rsplit("```", 1)[0]
-
         parsed = json.loads(raw)
 
-        parsed["source"] = source_type
-        parsed["date"] = datetime.now().strftime("%Y-%m-%d")
-        parsed["source_title"] = item["title"]
+        title = clean_text(parsed.get("title", ""))
+        text = clean_text(parsed.get("text", ""))
 
-        return parsed
-
-    except Exception as e:
-        print(f"Ошибка GPT: {e}")
+        if not title or not text:
+            raise ValueError("Empty title/text from model")
 
         return {
             "source": source_type,
-            "title": item["title"],
-            "text": item.get("description", ""),
+            "title": title,
+            "text": text,
             "date": datetime.now().strftime("%Y-%m-%d"),
             "source_title": item["title"]
         }
 
+    except Exception as e:
+        print(f"Ошибка GPT для '{item['title']}': {e}", flush=True)
+
+        fallback_text = clean_text(item.get("description", ""))
+        if not fallback_text:
+            fallback_text = f"Поступил новый материал: {clean_text(item['title'])}"
+
+        return {
+            "source": source_type,
+            "title": item["title"],
+            "text": fallback_text,
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "source_title": item["title"]
+        }
 
 def save_to_github(news_list):
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
-
     headers = {
-        "Authorization": f"token {GH_TOKEN}",
+        "Authorization": f"Bearer {GH_TOKEN}",
         "Accept": "application/vnd.github+json"
     }
 
@@ -232,9 +256,8 @@ def save_to_github(news_list):
     encoded = base64.b64encode(content_json.encode("utf-8")).decode("utf-8")
 
     sha = ""
-
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=20)
         if resp.status_code == 200:
             sha = resp.json().get("sha", "")
     except Exception:
@@ -242,62 +265,63 @@ def save_to_github(news_list):
 
     payload = {
         "message": "Update news",
-        "content": encoded,
+        "content": encoded
     }
 
     if sha:
         payload["sha"] = sha
 
-    resp = requests.put(url, headers=headers, json=payload, timeout=15)
+    resp = requests.put(url, headers=headers, json=payload, timeout=20)
 
     if resp.status_code in (200, 201):
-        print("GitHub обновлен!")
+        print("GitHub updated", flush=True)
     else:
-        print(f"Ошибка GitHub: {resp.status_code} {resp.text}")
+        print(f"GitHub error: {resp.status_code} {resp.text}", flush=True)
 
+def main():
+    existing, _ = get_existing_news()
 
-# === MAIN ===
+    existing_titles = {
+        n.get("source_title", "").lower()
+        for n in existing
+        if n.get("source_title")
+    }
 
-existing, _ = get_existing_news()
+    print(f"На сайте сейчас: {len(existing)}", flush=True)
 
-existing_titles = {
-    n.get("source_title", "").lower()
-    for n in existing
-}
+    laws = fetch_rss("http://publication.pravo.gov.ru/api/rss?pageSize=200", "law")
+    news = fetch_rss("https://lenta.ru/rss/news", "news")
 
-print(f"На сайте сейчас: {len(existing)}")
+    print(f"Найдено: laws={len(laws)} news={len(news)}", flush=True)
 
-laws = fetch_rss("http://publication.pravo.gov.ru/api/rss?pageSize=200")
-news = fetch_rss("https://lenta.ru/rss/news")
-
-print(f"Найдено: laws={len(laws)} news={len(news)}")
-
-new_item = None
-new_source = None
-
-for item in laws:
-    if item["title"].lower() not in existing_titles:
-        new_item = item
-        new_source = "law"
-        break
-
-if not new_item:
-    for item in news:
+    candidates = []
+    for item in laws + news:
         if item["title"].lower() not in existing_titles:
-            new_item = item
-            new_source = "news"
-            break
+            candidates.append(item)
 
-if not new_item:
-    print("Нет новых материалов")
-else:
-    print(f"Публикуем: {new_item['title']}")
+    if not candidates:
+        print("Нет новых материалов", flush=True)
+        return
 
-    article = rewrite_one(new_item, new_source)
+    candidates.sort(key=lambda x: (x["score"], 1 if x["source_type"] == "law" else 0), reverse=True)
 
+    best = candidates[0]
+    print(
+        f"Выбрано: score={best['score']} source={best['source_type']} title={best['title']}",
+        flush=True
+    )
+    print(f"Причины: {', '.join(best['reasons'])}", flush=True)
+
+    if best["score"] < MIN_SCORE:
+        print("Нет материалов с достаточным качеством", flush=True)
+        return
+
+    article = rewrite_one(best)
     updated = [article] + existing
     updated = updated[:MAX_NEWS_ON_SITE]
 
     save_to_github(updated)
+    print("Done!", flush=True)
 
-    print("Done!")
+if __name__ == "__main__":
+    main()
