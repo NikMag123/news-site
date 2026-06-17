@@ -94,7 +94,15 @@ def classify_item(title, desc, source_type):
 
     reasons = []
 
+    regional_words = [
+        "области", "республики", "края", "округа", "автономного округа",
+        "республика ", "область ", "край ", "округ "
+    ]
+
     if source_type == "law":
+        is_regional = has_any(text, regional_words)
+        if geo_hits == 0 and is_regional:
+            return False, 0, ["regional_not_allowed"]
         if geo_hits == 0 and federal_hits == 0:
             return False, 0, ["no_krasnodar_and_not_federal"]
         if geo_hits == 0 and core_hits == 0:
