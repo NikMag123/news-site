@@ -22,7 +22,7 @@ if not GH_TOKEN:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 CORE_KEYWORDS = [
-    "недвижимость", "квартир", "дом", "жиль", "жил",
+    "недвиж", "квартир", "дом", "жиль", "жил",
     "земл", "участок", "кадастр", "росреестр", "ипотек",
     "аренд", "собственност", "долев", "многоквартир",
     "капремонт", "перепланиров", "разрешение на строительство",
@@ -41,23 +41,21 @@ GEO_ALLOWED = [
     "краснодарский край"
 ]
 
-DOC_KEYWORDS = [
+FEDERAL_SCOPE_MARKERS = [
+    "российской федерации",
     "федеральный закон",
-    "постановление правительства",
-    "постановление",
-    "приказ",
-    "распоряжение",
-    "пленум",
-    "верховный суд",
-    "конституционный суд",
-    "обзор судебной практики",
-    "разъяснение",
-    "решение суда",
-    "определение суда",
-    "кадастровой стоимости",
+    "верховный суд российской федерации",
+    "конституционный суд российской федерации",
+    "правительство российской федерации",
+    "минстрой россии",
     "росреестр",
-    "минстрой",
-    "минэкономразвития"
+]
+
+IRRELEVANT_HINTS = [
+    "спорт", "культура", "кино", "театр", "концерт",
+    "погода", "туризм", "школ", "образован", "медицин",
+    "авар", "пожар", "кримин", "полици", "шоу",
+    "фестиваль", "ремонт дорог"
 ]
 
 HARD_BLOCK_HINTS = [
@@ -78,13 +76,6 @@ HARD_BLOCK_HINTS = [
     "оплаты труда"
 ]
 
-IRRELEVANT_HINTS = [
-    "спорт", "культура", "кино", "театр", "концерт",
-    "погода", "туризм", "школ", "образован", "медицин",
-    "авар", "пожар", "кримин", "полици", "шоу",
-    "фестиваль", "ремонт дорог"
-]
-
 def clean_text(s):
     return " ".join(unescape((s or "")).split()).strip()
 
@@ -97,56 +88,59 @@ def classify_item(title, desc, source_type):
     core_hits = sum(1 for kw in CORE_KEYWORDS if kw in text)
     secondary_hits = sum(1 for kw in SECONDARY_KEYWORDS if kw in text)
     geo_hits = sum(1 for kw in GEO_ALLOWED if kw in text)
-    doc_hits = sum(1 for kw in DOC_KEYWORDS if kw in text)
+    federal_hits = sum(1 for kw in FEDERAL_SCOPE_MARKERS if kw in text)
     irrelevant_hits = sum(1 for kw in IRRELEVANT_HINTS if kw in text)
     hard_block_hits = [kw for kw in HARD_BLOCK_HINTS if kw in text]
 
     reasons = []
 
-    if hard_block_hits and core_hits == 0:
-        return False, 0, ["hard_block"]
-
-    if core_hits == 0:
-        return False, 0, ["no_core_topic"]
-
     if source_type == "law":
-        if geo_hits == 0 and doc_hits == 0 and secondary_hits == 0 and core_hits < 2:
-            return False, 0, ["law_not_specific_enough"]
-    else:
-        if core_hits < 1:
-            return False, 0, ["news_not_relevant"]
+        if geo_hits == 0 and federal_hits == 0:
+            return False, 0, ["no_krasnodar_and_not_federal"]
+        if geo_hits == 0 and core_hits == 0:
+            return False, 0, ["federal_but_not_real_estate"]
+
+    if source_type == "news":
+        if core_hits == 0 and geo_hits == 0:
+            return False, 0, ["not_relevant"]
+
+    if hard_block_hits and geo_hits == 0 and federal_hits == 0:
+        return False, 0, ["hard_block"]
 
     score = 0
     score += core_hits * 3
-    score += secondary_hits * 1
-    score += geo_hits * 3
-    score += doc_hits * 2
+    score += secondary_hits
+    score += geo_hits * 4
+    score += federal_hits * 2
 
     if source_type == "law":
         score += 1
-        reasons.append("source:law")
-    else:
-        score += 0
-        reasons.append("source:news")
 
     if irrelevant_hits:
         score -= 3
-        reasons.append("irrelevant")
 
     if has_any(text, ["верховн", "пленум", "судебн", "разъяснен", "определен", "решени"]):
         score += 2
-        reasons.append("court")
 
     if has_any(text, ["федеральный закон", "постановлен", "приказ", "распоряжен", "указ"]):
         score += 1
-        reasons.append("legal_doc")
 
-    reasons.append(f"core:{core_hits}")
-    reasons.append(f"secondary:{secondary_hits}")
-    reasons.append(f"geo:{geo_hits}")
-    reasons.append(f"docs:{doc_hits}")
+    reasons.extend([
+        f"core:{core_hits}",
+        f"secondary:{secondary_hits}",
+        f"geo:{geo_hits}",
+        f"federal:{federal_hits}"
+    ])
 
-    return score >= MIN_SCORE, score, reasons
+    if irrelevant_hits:
+        reasons.append("irrelevant")
+    if hard_block_hits:
+        reasons.append("hard_block_hint")
+
+    if score < MIN_SCORE:
+        return False, score, reasons
+
+    return True, score, reasons
 
 def fetch_rss(url, source_type):
     try:
