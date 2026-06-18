@@ -1,10 +1,12 @@
 import os
 import json
 import base64
+import re
 import requests
 import xml.etree.ElementTree as ET
 from html import unescape
 from datetime import datetime
+from urllib.parse import urljoin
 from openai import OpenAI
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -12,7 +14,7 @@ GH_TOKEN = os.getenv("GH_TOKEN")
 REPO = "NikMag123/news-site"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_NEWS_ON_SITE = 50
-MIN_SCORE = 5
+MIN_SCORE = 4
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -21,27 +23,25 @@ if not GH_TOKEN:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
 CORE_KEYWORDS = [
     "недвиж", "квартир", "дом", "жиль", "жил",
     "земл", "участок", "кадастр", "росреестр", "ипотек",
     "аренд", "собственност", "долев", "многоквартир",
     "капремонт", "перепланиров", "разрешение на строительство",
-    "строительств", "застройщик", "реконструкц"
+    "строительств", "застройщик", "реконструкц", "новострой",
+    "рынок жилья", "ввод жилья", "сделк", "жк",
 ]
 
-SECONDARY_KEYWORDS = [
-    "жкх", "коммунальн", "собственник", "арендатор",
-    "регистрация прав", "права собственности", "жилое помещение"
+REGIONAL_KEYWORDS = [
+    "краснодар", "сочи", "кубан", "краснодарский край"
 ]
 
-GEO_ALLOWED = [
-    "краснодар",
-    "сочи",
-    "кубан",
-    "краснодарский край"
-]
-
-FEDERAL_SCOPE_MARKERS = [
+FEDERAL_KEYWORDS = [
     "российской федерации",
     "федеральный закон",
     "верховный суд российской федерации",
@@ -49,13 +49,15 @@ FEDERAL_SCOPE_MARKERS = [
     "правительство российской федерации",
     "минстрой россии",
     "росреестр",
+    "минстрой рф",
 ]
 
 IRRELEVANT_HINTS = [
     "спорт", "культура", "кино", "театр", "концерт",
     "погода", "туризм", "школ", "образован", "медицин",
     "авар", "пожар", "кримин", "полици", "шоу",
-    "фестиваль", "ремонт дорог"
+    "фестиваль", "ремонт дорог", "бензин", "зарплат",
+    "наличн", "политик", "отставк",
 ]
 
 HARD_BLOCK_HINTS = [
@@ -72,72 +74,166 @@ HARD_BLOCK_HINTS = [
     "бюджет",
     "бюджетирование",
     "казнач",
-    "зарплат",
-    "оплаты труда"
+    "оплаты труда",
 ]
+
+SOURCE_WEIGHTS = {
+    "rbc": 3,
+    "pravo": 2,
+    "lenta": 1,
+}
 
 def clean_text(s):
     return " ".join(unescape((s or "")).split()).strip()
 
+def strip_tags(s):
+    return re.sub(r"<[^>]+>", " ", s or "")
+
 def has_any(text, words):
     return any(w in text for w in words)
+
+def fetch_page_description(url):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+
+        patterns = [
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html, flags=re.I | re.S)
+            if m:
+                return clean_text(m.group(1))
+    except Exception:
+        pass
+    return ""
+
+def fetch_rss_items(url, source_type):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception as e:
+        print(f"Ошибка загрузки {url}: {e}", flush=True)
+        return []
+
+    results = []
+    for item in root.iter("item"):
+        title = item.find("title")
+        desc = item.find("description")
+        link = item.find("link")
+
+        title_text = clean_text(title.text if title is not None else "")
+        desc_text = clean_text(desc.text if desc is not None else "")
+        link_text = clean_text(link.text if link is not None else "")
+
+        if not title_text:
+            continue
+
+        results.append({
+            "title": title_text,
+            "description": desc_text,
+            "source_type": source_type,
+            "source_url": link_text,
+        })
+
+    return results
+
+def fetch_pravo():
+    return fetch_rss_items("https://publication.pravo.gov.ru/api/rss?pageSize=200", "pravo")
+
+def fetch_lenta():
+    return fetch_rss_items("https://lenta.ru/rss/news", "lenta")
+
+def fetch_rbc_kuban():
+    url = "https://kuban.rbc.ru/krasnodar/"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=25)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        print(f"Ошибка загрузки RBC Краснодар: {e}", flush=True)
+        return []
+
+    results = []
+    seen = set()
+
+    for href, inner in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.I | re.S):
+        href = clean_text(unescape(href))
+        if "/krasnodar/" not in href and "kuban.plus.rbc.ru/news/" not in href:
+            continue
+
+        title_text = clean_text(strip_tags(inner))
+        if len(title_text) < 20:
+            continue
+
+        key = title_text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        results.append({
+            "title": title_text,
+            "description": "",
+            "source_type": "rbc",
+            "source_url": urljoin(url, href),
+        })
+
+    return results
 
 def classify_item(title, desc, source_type):
     text = (title + " " + desc).lower()
 
     core_hits = sum(1 for kw in CORE_KEYWORDS if kw in text)
-    secondary_hits = sum(1 for kw in SECONDARY_KEYWORDS if kw in text)
-    geo_hits = sum(1 for kw in GEO_ALLOWED if kw in text)
-    federal_hits = sum(1 for kw in FEDERAL_SCOPE_MARKERS if kw in text)
+    region_hits = sum(1 for kw in REGIONAL_KEYWORDS if kw in text)
+    federal_hits = sum(1 for kw in FEDERAL_KEYWORDS if kw in text)
     irrelevant_hits = sum(1 for kw in IRRELEVANT_HINTS if kw in text)
     hard_block_hits = [kw for kw in HARD_BLOCK_HINTS if kw in text]
+    source_weight = SOURCE_WEIGHTS.get(source_type, 1)
 
     reasons = []
 
-    regional_words = [
-        "области", "республики", "края", "округа", "автономного округа",
-        "республика ", "область ", "край ", "округ "
-    ]
-
-    if source_type == "law":
-        is_regional = has_any(text, regional_words)
-        if geo_hits == 0 and is_regional:
-            return False, 0, ["regional_not_allowed"]
-        if geo_hits == 0 and federal_hits == 0:
-            return False, 0, ["no_krasnodar_and_not_federal"]
-        if geo_hits == 0 and core_hits == 0:
-            return False, 0, ["federal_but_not_real_estate"]
-
-    if source_type == "news":
-        if core_hits == 0 and geo_hits == 0:
-            return False, 0, ["not_relevant"]
-
-    if hard_block_hits and geo_hits == 0 and federal_hits == 0:
+    if hard_block_hits and core_hits == 0 and region_hits == 0 and federal_hits == 0:
         return False, 0, ["hard_block"]
+
+    if source_type == "rbc":
+        if core_hits == 0:
+            return False, 0, ["rbc_not_real_estate"]
+
+    elif source_type == "pravo":
+        if core_hits == 0:
+            return False, 0, ["pravo_not_real_estate"]
+        if region_hits == 0 and federal_hits == 0:
+            return False, 0, ["pravo_not_kuban_or_federal"]
+
+    elif source_type == "lenta":
+        if core_hits == 0:
+            return False, 0, ["lenta_not_real_estate"]
+        if region_hits == 0 and federal_hits == 0:
+            return False, 0, ["lenta_not_kuban_or_federal"]
 
     score = 0
     score += core_hits * 3
-    score += secondary_hits
-    score += geo_hits * 4
+    score += region_hits * 3
     score += federal_hits * 2
+    score += source_weight
 
-    if source_type == "law":
+    if has_any(text, ["верховн", "пленум", "судебн", "разъяснен", "определен", "решени"]):
+        score += 2
+
+    if has_any(text, ["ипотек", "новостро", "застройщ", "кадастр", "росреестр", "земл", "аренд", "капремонт"]):
         score += 1
 
     if irrelevant_hits:
         score -= 3
 
-    if has_any(text, ["верховн", "пленум", "судебн", "разъяснен", "определен", "решени"]):
-        score += 2
-
-    if has_any(text, ["федеральный закон", "постановлен", "приказ", "распоряжен", "указ"]):
-        score += 1
-
     reasons.extend([
         f"core:{core_hits}",
-        f"secondary:{secondary_hits}",
-        f"geo:{geo_hits}",
-        f"federal:{federal_hits}"
+        f"region:{region_hits}",
+        f"federal:{federal_hits}",
+        f"source:{source_type}",
     ])
 
     if irrelevant_hits:
@@ -149,40 +245,6 @@ def classify_item(title, desc, source_type):
         return False, score, reasons
 
     return True, score, reasons
-
-def fetch_rss(url, source_type):
-    try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-    except Exception as e:
-        print(f"Ошибка загрузки {url}: {e}", flush=True)
-        return []
-
-    results = []
-
-    for item in root.iter("item"):
-        title = item.find("title")
-        desc = item.find("description")
-
-        title_text = clean_text(title.text if title is not None else "")
-        desc_text = clean_text(desc.text if desc is not None else "")
-
-        if not title_text:
-            continue
-
-        ok, score, reasons = classify_item(title_text, desc_text, source_type)
-
-        results.append({
-            "title": title_text,
-            "description": desc_text,
-            "source_type": source_type,
-            "score": score,
-            "reasons": reasons,
-            "ok": ok
-        })
-
-    return results
 
 def get_existing_news():
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
@@ -206,6 +268,12 @@ def get_existing_news():
     return [], ""
 
 def rewrite_one(item):
+    desc = item.get("description", "") or ""
+    if len(desc) < 80 and item.get("source_url"):
+        extra = fetch_page_description(item["source_url"])
+        if extra:
+            desc = extra
+
     prompt = f"""
 Ты — юридический редактор сайта юриста по недвижимости в Краснодарском крае и Сочи.
 
@@ -213,7 +281,7 @@ def rewrite_one(item):
 
 Исходный материал:
 Заголовок: {item["title"]}
-Описание: {item.get("description", "")}
+Описание: {desc}
 
 Правила:
 1. Не выдумывай факты, цифры, регионы, последствия и источники.
@@ -269,13 +337,14 @@ def rewrite_one(item):
             "title": title,
             "text": text,
             "date": datetime.now().strftime("%Y-%m-%d"),
-            "source_title": item["title"]
+            "source_title": item["title"],
+            "source_url": item.get("source_url", ""),
         }
 
     except Exception as e:
         print(f"Ошибка GPT для '{item['title']}': {e}", flush=True)
 
-        fallback_text = clean_text(item.get("description", ""))
+        fallback_text = clean_text(desc)
         if not fallback_text:
             fallback_text = f"Поступил новый материал: {clean_text(item['title'])}"
 
@@ -284,7 +353,8 @@ def rewrite_one(item):
             "title": item["title"],
             "text": fallback_text,
             "date": datetime.now().strftime("%Y-%m-%d"),
-            "source_title": item["title"]
+            "source_title": item["title"],
+            "source_url": item.get("source_url", ""),
         }
 
 def save_to_github(news_list):
@@ -307,7 +377,7 @@ def save_to_github(news_list):
 
     payload = {
         "message": "Update news",
-        "content": encoded
+        "content": encoded,
     }
 
     if sha:
@@ -331,21 +401,35 @@ def main():
 
     print(f"На сайте сейчас: {len(existing)}", flush=True)
 
-    laws = fetch_rss("http://publication.pravo.gov.ru/api/rss?pageSize=200", "law")
-    news = fetch_rss("https://lenta.ru/rss/news", "news")
+    laws = fetch_pravo()
+    rbc = fetch_rbc_kuban()
+    lenta = fetch_lenta()
 
-    print(f"Найдено: laws={len(laws)} news={len(news)}", flush=True)
+    print(f"Найдено: pravo={len(laws)} rbc={len(rbc)} lenta={len(lenta)}", flush=True)
 
     candidates = []
-    for item in laws + news:
-        if item["title"].lower() not in existing_titles and item["ok"]:
-            candidates.append(item)
+    for item in (rbc + laws + lenta):
+        title_key = item["title"].lower()
+        if title_key in existing_titles:
+            continue
+        ok, score, reasons = classify_item(item["title"], item.get("description", ""), item["source_type"])
+        if not ok:
+            continue
+        item["score"] = score
+        item["reasons"] = reasons
+        candidates.append(item)
 
     if not candidates:
         print("Нет новых материалов", flush=True)
         return
 
-    candidates.sort(key=lambda x: (x["score"], 1 if x["source_type"] == "law" else 0), reverse=True)
+    candidates.sort(
+        key=lambda x: (
+            x["score"],
+            2 if x["source_type"] == "rbc" else 1 if x["source_type"] == "pravo" else 0
+        ),
+        reverse=True
+    )
 
     best = candidates[0]
     print(
