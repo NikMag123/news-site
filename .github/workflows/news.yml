@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install openai requests
+        run: pip install openai requests beautifulsoup4
 
       - name: Run news script
         env:
