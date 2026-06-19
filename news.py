@@ -4,6 +4,7 @@ import base64
 import re
 import requests
 import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 from html import unescape
 from datetime import datetime
 from urllib.parse import urljoin
@@ -86,29 +87,69 @@ SOURCE_WEIGHTS = {
 def clean_text(s):
     return " ".join(unescape((s or "")).split()).strip()
 
-def strip_tags(s):
-    return re.sub(r"<[^>]+>", " ", s or "")
-
 def has_any(text, words):
     return any(w in text for w in words)
 
-def fetch_page_description(url):
+def extract_body_from_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    selectors = [
+        "div.article__text",
+        "div.js-news-text",
+        "div[itemprop='articleBody']",
+        "article",
+        "section.article",
+        "div.article",
+    ]
+
+    candidates = []
+
+    for selector in selectors:
+        for block in soup.select(selector):
+            paragraphs = [
+                clean_text(p.get_text(" ", strip=True))
+                for p in block.find_all("p")
+            ]
+            paragraphs = [p for p in paragraphs if len(p) > 20]
+
+            if paragraphs:
+                text = "\n\n".join(paragraphs)
+                if len(text) > 200:
+                    candidates.append(text)
+                    continue
+
+            text = clean_text(block.get_text(" ", strip=True))
+            if len(text) > 300:
+                candidates.append(text)
+
+    if candidates:
+        return max(candidates, key=len)
+
+    meta_selectors = [
+        ('meta[name="description"]', "content"),
+        ('meta[property="og:description"]', "content"),
+    ]
+
+    for selector, attr in meta_selectors:
+        tag = soup.select_one(selector)
+        if tag and tag.get(attr):
+            text = clean_text(tag.get(attr))
+            if text:
+                return text
+
+    return ""
+
+def fetch_page_body(url):
+    if not url:
+        return ""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
-        html = resp.text
-
-        patterns = [
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, html, flags=re.I | re.S)
-            if m:
-                return clean_text(m.group(1))
-    except Exception:
-        pass
-    return ""
+        body = extract_body_from_html(resp.text)
+        return body
+    except Exception as e:
+        print(f"Ошибка загрузки страницы {url}: {e}", flush=True)
+        return ""
 
 def fetch_rss_items(url, source_type):
     try:
@@ -152,7 +193,7 @@ def fetch_rbc_kuban():
     try:
         resp = requests.get(url, headers=HEADERS, timeout=25)
         resp.raise_for_status()
-        html = resp.text
+        soup = BeautifulSoup(resp.text, "html.parser")
     except Exception as e:
         print(f"Ошибка загрузки RBC Краснодар: {e}", flush=True)
         return []
@@ -160,12 +201,12 @@ def fetch_rbc_kuban():
     results = []
     seen = set()
 
-    for href, inner in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.I | re.S):
-        href = clean_text(unescape(href))
+    for a in soup.find_all("a", href=True):
+        href = clean_text(unescape(a["href"]))
         if "/krasnodar/" not in href and "kuban.plus.rbc.ru/news/" not in href:
             continue
 
-        title_text = clean_text(strip_tags(inner))
+        title_text = clean_text(a.get_text(" ", strip=True))
         if len(title_text) < 20:
             continue
 
@@ -269,10 +310,15 @@ def get_existing_news():
 
 def rewrite_one(item):
     desc = item.get("description", "") or ""
-    if len(desc) < 80 and item.get("source_url"):
-        extra = fetch_page_description(item["source_url"])
-        if extra:
-            desc = extra
+    body = ""
+    if item.get("source_url"):
+        body = fetch_page_body(item["source_url"])
+
+    if len(body) < 120:
+        body = desc
+
+    if len(body) > 7000:
+        body = body[:7000] + " ..."
 
     prompt = f"""
 Ты — юридический редактор сайта юриста по недвижимости в Краснодарском крае и Сочи.
@@ -281,7 +327,8 @@ def rewrite_one(item):
 
 Исходный материал:
 Заголовок: {item["title"]}
-Описание: {desc}
+Короткое описание: {desc}
+Полный текст статьи: {body}
 
 Правила:
 1. Не выдумывай факты, цифры, регионы, последствия и источники.
@@ -333,7 +380,7 @@ def rewrite_one(item):
             raise ValueError("Empty title/text from model")
 
         return {
-            "source": item["source_type"],
+            "source": "law" if item["source_type"] == "pravo" else "news",
             "title": title,
             "text": text,
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -344,12 +391,12 @@ def rewrite_one(item):
     except Exception as e:
         print(f"Ошибка GPT для '{item['title']}': {e}", flush=True)
 
-        fallback_text = clean_text(desc)
+        fallback_text = clean_text(desc or body)
         if not fallback_text:
             fallback_text = f"Поступил новый материал: {clean_text(item['title'])}"
 
         return {
-            "source": item["source_type"],
+            "source": "law" if item["source_type"] == "pravo" else "news",
             "title": item["title"],
             "text": fallback_text,
             "date": datetime.now().strftime("%Y-%m-%d"),
