@@ -1,12 +1,15 @@
 name: Deploy news.json
 
 on:
+  workflow_run:
+    workflows: ["News Rewriter"]
+    types:
+      - completed
   workflow_dispatch:
-  schedule:
-    - cron: '0 6 */3 * *'
 
 jobs:
   deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -24,3 +27,7 @@ jobs:
           local-dir: ./
           server-dir: /news/public_html/
           dangerous-clean-slate: false
+          exclude: |
+            **/*
+          include: |
+            news.json
