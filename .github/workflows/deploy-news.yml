@@ -1,0 +1,17 @@
+name: Deploy news.json
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 */3 * *'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show news file
+        run: ls -la
