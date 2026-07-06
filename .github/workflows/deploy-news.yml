@@ -13,5 +13,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show news file
-        run: ls -la
+      - name: Upload news.json to Timeweb
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.TIMEWEB_HOST }}
+          username: ${{ secrets.TIMEWEB_USER }}
+          password: ${{ secrets.TIMEWEB_PASSWORD }}
+          port: ${{ secrets.TIMEWEB_PORT }}
+          source: "news.json"
+          target: "/home/cp522538/news/public_html/"
