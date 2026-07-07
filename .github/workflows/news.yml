@@ -34,7 +34,7 @@ jobs:
       - name: Prepare deploy folder
         run: |
           mkdir deploy
-          copy news.json deploy/news.json
+          cp news.json deploy/news.json
 
       - name: Upload news.json via FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
