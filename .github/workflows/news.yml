@@ -30,3 +30,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           OPENAI_MODEL: gpt-4o-mini
         run: python news.py
+
+      - name: Prepare deploy folder
+        run: |
+          mkdir deploy
+          copy news.json deploy/news.json
+
+      - name: Upload news.json via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.TIMEWEB_HOST }}
+          username: ${{ secrets.TIMEWEB_USER }}
+          password: ${{ secrets.TIMEWEB_PASSWORD }}
+          port: ${{ secrets.TIMEWEB_PORT }}
+          protocol: ftp
+          local-dir: ./deploy/
+          server-dir: /news/public_html/
+          dangerous-clean-slate: false
