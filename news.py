@@ -97,6 +97,36 @@ def clean_text(s):
 def has_any(text, words):
     return any(w in text for w in words)
 
+def build_neutral_title(item, body):
+    text = (item.get("title", "") + " " + item.get("description", "") + " " + body).lower()
+
+    if has_any(text, ["самострой", "самовольн"]):
+        return "Спор о самовольной постройке"
+    if has_any(text, ["дду", "дольщик"]):
+        return "Вопросы защиты дольщиков"
+    if has_any(text, ["ипотек"]):
+        return "Споры по ипотеке и жилью"
+    if has_any(text, ["аренд"]):
+        return "Споры об аренде жилья"
+    if has_any(text, ["земл", "участок", "кадастр"]):
+        return "Споры о земельных участках"
+    if has_any(text, ["собственност"]):
+        return "Споры о праве собственности"
+    if has_any(text, ["застройщик", "новострой", "строительств"]):
+        return "Строительные споры и застройщик"
+    if has_any(text, ["жкх", "тсж", "управляющ"]):
+        return "Вопросы по управлению жильем"
+
+    return "Юридический вопрос по недвижимости"
+
+def title_too_close(a, b):
+    a_words = {w for w in re.findall(r"[а-яa-z0-9]+", (a or "").lower()) if len(w) > 2}
+    b_words = {w for w in re.findall(r"[а-яa-z0-9]+", (b or "").lower()) if len(w) > 2}
+    if not a_words or not b_words:
+        return False
+    overlap = len(a_words & b_words) / max(len(a_words), len(b_words))
+    return overlap >= 0.6 or (a or "").lower() in (b or "").lower() or (b or "").lower() in (a or "").lower()
+
 def extract_body_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
@@ -361,19 +391,19 @@ def rewrite_one(item):
     prompt = f"""
     Ты — юридический редактор сайта по недвижимости и строительству в России.
 
-Сделай не сухой пересказ, а короткий живой юридический комментарий к материалу.
+    Сделай не сухой пересказ, а короткий живой юридический комментарий к материалу.
 
 Исходный материал:
 Заголовок: {item["title"]}
 Короткое описание: {desc}
 Полный текст статьи: {body}
 
-Правила:
-1. Не выдумывай факты, цифры, регионы, последствия и источники.
-    2. Не добавляй Сочи, Краснодарский край, недвижимость или практические выводы, если этого нет в исходнике.
-3. Не делай текст рекламным.
-4. Не используй канцелярский стиль.
-5. Можно добавить только нейтральное пояснение и практический смысл.
+    Правила:
+    1. Не выдумывай факты, цифры, регионы, последствия и источники.
+    2. Придумай новый заголовок, не копируй исходный заголовок дословно и не повторяй его почти полностью.
+    3. Не делай текст рекламным.
+    4. Не используй канцелярский стиль.
+    5. Можно добавить только нейтральное пояснение и практический смысл.
 6. Текст должен состоять из 4 коротких фраз:
    - что произошло;
    - что это значит на практике;
@@ -417,6 +447,9 @@ def rewrite_one(item):
         if not title or not text:
             raise ValueError("Empty title/text from model")
 
+        if title_too_close(title, item["title"]):
+            title = build_neutral_title(item, body)
+
         return {
             "source": "law" if item["source_type"] in ("pravo", "vsrf") else "news",
             "title": title,
@@ -435,7 +468,7 @@ def rewrite_one(item):
 
         return {
             "source": "law" if item["source_type"] in ("pravo", "vsrf") else "news",
-            "title": item["title"],
+            "title": build_neutral_title(item, body),
             "text": fallback_text,
             "date": datetime.now().strftime("%Y-%m-%d"),
             "source_title": item["title"],
@@ -487,13 +520,12 @@ def main():
     print(f"На сайте сейчас: {len(existing)}", flush=True)
 
     laws = fetch_pravo()
-    rbc = fetch_rbc_kuban()
     vsrf = fetch_vsrf()
 
-    print(f"Найдено: pravo={len(laws)} rbc={len(rbc)} vsrf={len(vsrf)}", flush=True)
+    print(f"Найдено: pravo={len(laws)} vsrf={len(vsrf)}", flush=True)
 
     candidates = []
-    for item in (vsrf + rbc + laws):
+    for item in (vsrf + laws):
         title_key = item["title"].lower()
         if title_key in existing_titles:
             continue
@@ -511,7 +543,7 @@ def main():
     candidates.sort(
         key=lambda x: (
             x["score"],
-            3 if x["source_type"] == "vsrf" else 2 if x["source_type"] == "rbc" else 1 if x["source_type"] == "pravo" else 0
+            2 if x["source_type"] == "vsrf" else 1 if x["source_type"] == "pravo" else 0
         ),
         reverse=True
     )
