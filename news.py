@@ -36,6 +36,9 @@ CORE_KEYWORDS = [
     "капремонт", "перепланиров", "разрешение на строительство",
     "строительств", "застройщик", "реконструкц", "новострой",
     "рынок жилья", "ввод жилья", "сделк", "жк",
+    "дду", "дольщик", "самострой", "самовольн", "жкх",
+    "управляющ", "тсж", "снос", "права собственности",
+    "жилой комплекс", "земельн", "ипотечн", "арбитраж",
 ]
 
 REGIONAL_KEYWORDS = [
@@ -45,12 +48,16 @@ REGIONAL_KEYWORDS = [
 FEDERAL_KEYWORDS = [
     "российской федерации",
     "федеральный закон",
+    "верховный суд",
     "верховный суд российской федерации",
     "конституционный суд российской федерации",
     "правительство российской федерации",
     "минстрой россии",
     "росреестр",
     "минстрой рф",
+    "пленум",
+    "президиум",
+    "обзор судебной практики",
 ]
 
 IRRELEVANT_HINTS = [
@@ -79,9 +86,9 @@ HARD_BLOCK_HINTS = [
 ]
 
 SOURCE_WEIGHTS = {
+    "vsrf": 4,
     "rbc": 3,
     "pravo": 2,
-    "lenta": 1,
 }
 
 def clean_text(s):
@@ -185,8 +192,47 @@ def fetch_rss_items(url, source_type):
 def fetch_pravo():
     return fetch_rss_items("https://publication.pravo.gov.ru/api/rss?pageSize=200", "pravo")
 
-def fetch_lenta():
-    return fetch_rss_items("https://lenta.ru/rss/news", "lenta")
+def fetch_vsrf():
+    pages = [
+        "https://vsrf.ru/",
+        "https://vsrf.ru/press_center/news/",
+        "https://vsrf.ru/documents/",
+    ]
+
+    results = []
+    seen = set()
+
+    for url in pages:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception as e:
+            print(f"Ошибка загрузки ВС РФ {url}: {e}", flush=True)
+            continue
+
+        for a in soup.find_all("a", href=True):
+            href = clean_text(unescape(a["href"]))
+            if "/press_center/news/" not in href and "/documents/" not in href:
+                continue
+
+            title_text = clean_text(a.get_text(" ", strip=True))
+            if len(title_text) < 20:
+                continue
+
+            key = title_text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            results.append({
+                "title": title_text,
+                "description": "",
+                "source_type": "vsrf",
+                "source_url": urljoin(url, href),
+            })
+
+    return results
 
 def fetch_rbc_kuban():
     url = "https://kuban.rbc.ru/krasnodar/"
@@ -246,14 +292,6 @@ def classify_item(title, desc, source_type):
     elif source_type == "pravo":
         if core_hits == 0:
             return False, 0, ["pravo_not_real_estate"]
-        if region_hits == 0 and federal_hits == 0:
-            return False, 0, ["pravo_not_kuban_or_federal"]
-
-    elif source_type == "lenta":
-        if core_hits == 0:
-            return False, 0, ["lenta_not_real_estate"]
-        if region_hits == 0 and federal_hits == 0:
-            return False, 0, ["lenta_not_kuban_or_federal"]
 
     score = 0
     score += core_hits * 3
@@ -321,7 +359,7 @@ def rewrite_one(item):
         body = body[:7000] + " ..."
 
     prompt = f"""
-Ты — юридический редактор сайта юриста по недвижимости в Краснодарском крае и Сочи.
+    Ты — юридический редактор сайта по недвижимости и строительству в России.
 
 Сделай не сухой пересказ, а короткий живой юридический комментарий к материалу.
 
@@ -332,7 +370,7 @@ def rewrite_one(item):
 
 Правила:
 1. Не выдумывай факты, цифры, регионы, последствия и источники.
-2. Не добавляй Сочи, Краснодарский край, недвижимость или практические выводы, если этого нет в исходнике.
+    2. Не добавляй Сочи, Краснодарский край, недвижимость или практические выводы, если этого нет в исходнике.
 3. Не делай текст рекламным.
 4. Не используй канцелярский стиль.
 5. Можно добавить только нейтральное пояснение и практический смысл.
@@ -380,7 +418,7 @@ def rewrite_one(item):
             raise ValueError("Empty title/text from model")
 
         return {
-            "source": "law" if item["source_type"] == "pravo" else "news",
+            "source": "law" if item["source_type"] in ("pravo", "vsrf") else "news",
             "title": title,
             "text": text,
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -396,7 +434,7 @@ def rewrite_one(item):
             fallback_text = f"Поступил новый материал: {clean_text(item['title'])}"
 
         return {
-            "source": "law" if item["source_type"] == "pravo" else "news",
+            "source": "law" if item["source_type"] in ("pravo", "vsrf") else "news",
             "title": item["title"],
             "text": fallback_text,
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -450,12 +488,12 @@ def main():
 
     laws = fetch_pravo()
     rbc = fetch_rbc_kuban()
-    lenta = fetch_lenta()
+    vsrf = fetch_vsrf()
 
-    print(f"Найдено: pravo={len(laws)} rbc={len(rbc)} lenta={len(lenta)}", flush=True)
+    print(f"Найдено: pravo={len(laws)} rbc={len(rbc)} vsrf={len(vsrf)}", flush=True)
 
     candidates = []
-    for item in (rbc + laws + lenta):
+    for item in (vsrf + rbc + laws):
         title_key = item["title"].lower()
         if title_key in existing_titles:
             continue
@@ -473,7 +511,7 @@ def main():
     candidates.sort(
         key=lambda x: (
             x["score"],
-            2 if x["source_type"] == "rbc" else 1 if x["source_type"] == "pravo" else 0
+            3 if x["source_type"] == "vsrf" else 2 if x["source_type"] == "rbc" else 1 if x["source_type"] == "pravo" else 0
         ),
         reverse=True
     )
