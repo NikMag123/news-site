@@ -119,7 +119,7 @@ def extract_body_from_html(html, source_type):
         tag.decompose()
 
     selectors = {
-        "vsrf": ["div.js-news-text", "div[itemprop='articleBody']", "article"],
+        "vsrf": ["div.vs-content div.vs-text", "div.js-news-text", "div[itemprop='articleBody']", "article"],
         "pravo": ["div[itemprop='articleBody']", "article", "main"],
     }.get(source_type, ["div[itemprop='articleBody']", "article", "main"])
 
