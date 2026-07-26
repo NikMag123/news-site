@@ -20,8 +20,9 @@ REPO = "NikMag123/news-site"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_NEWS_ON_SITE = 50
 MIN_SCORE = 4
-MIN_BODY_LENGTH = 350
+MIN_BODY_LENGTH = 250
 MAX_BODY_LENGTH = 9000
+COPY_FRAGMENT_WORDS = 12
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -94,7 +95,7 @@ def sentence_count(text):
     return len([part for part in re.split(r"[.!?]+", text) if part.strip()])
 
 
-def has_long_copied_fragment(source, draft, n=6):
+def has_long_copied_fragment(source, draft, n=COPY_FRAGMENT_WORDS):
     source_words = words(source)
     draft_words = words(draft)
     source_ngrams = {
@@ -277,26 +278,28 @@ def get_existing_news():
         return []
 
 
-def ask_model(messages):
+def ask_model(messages, temperature=0):
     result = client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        temperature=0,
+        temperature=temperature,
         max_tokens=1400,
         response_format={"type": "json_object"},
     )
     return json.loads(result.choices[0].message.content.strip())
 
 
-def create_draft(item, body):
+def create_draft(item, body, retry_note=""):
+    retry_instruction = f"\nДополнительное требование: {retry_note}\n" if retry_note else ""
     prompt = f"""
 Ты готовишь короткую информационную заметку для российского сайта о недвижимости и строительстве.
 
 Используй ТОЛЬКО факты из исходного материала. Не используй общие знания.
 Не давай рекомендации, прогнозы, оценку выгодности сделки, обещания результата в суде или юридические консультации.
 Не добавляй регионы, даты, цифры, законы, участников спора или последствия, которых нет в материале.
-Не копируй фразы из источника длиннее четырех слов подряд.
+Не копируй предложения или крупные фрагменты исходника. Устойчивые названия органов, актов и юридических терминов допустимы.
 Если фактов недостаточно для содержательной заметки, верни approved=false.
+{retry_instruction}
 
 Исходный заголовок: {item['title']}
 Исходный материал:
@@ -313,7 +316,7 @@ def create_draft(item, body):
     return ask_model([
         {"role": "system", "content": "Ты аккуратный редактор. Возвращай только JSON."},
         {"role": "user", "content": prompt},
-    ])
+    ], temperature=0.2)
 
 
 def audit_draft(item, body, draft):
@@ -321,7 +324,7 @@ def audit_draft(item, body, draft):
 Проверь черновик информационной заметки по исходному материалу.
 Одобри только если каждый существенный факт черновика прямо подтверждается исходным текстом.
 Отклони, если есть совет, прогноз, обещание результата, неподтвержденный вывод, добавленный регион, дата, цифра, участник или правовое последствие.
-Отклони, если текст почти копирует исходник.
+Отклони из-за копирования только если черновик переносит целые предложения или крупные фрагменты исходника. Не считай копированием устойчивые официальные названия, реквизиты актов и юридические термины.
 
 Исходный материал:
 {body}
@@ -359,22 +362,34 @@ def validate_draft(body, draft):
 
 def rewrite_one(item, body):
     try:
-        draft = create_draft(item, body)
-        valid, reason = validate_draft(body, draft)
-        if not valid:
-            return None, reason
-        audit = audit_draft(item, body, draft)
-        if not audit.get("approved"):
-            return None, f"audit_failed:{clean_text(audit.get('reason', ''))}"
-        return {
-            "source": "law",
-            "title": clean_text(draft["title"]),
-            "text": clean_text(draft["text"]),
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "source_name": SOURCE_NAMES[item["source_type"]],
-            "source_title": item["title"],
-            "source_url": item["source_url"],
-        }, "ok"
+        retry_note = ""
+        last_status = "model_rejected_or_empty"
+        for _ in range(2):
+            draft = create_draft(item, body, retry_note)
+            valid, reason = validate_draft(body, draft)
+            if not valid:
+                last_status = reason
+            else:
+                audit = audit_draft(item, body, draft)
+                if audit.get("approved"):
+                    return {
+                        "source": "law",
+                        "title": clean_text(draft["title"]),
+                        "text": clean_text(draft["text"]),
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "source_name": SOURCE_NAMES[item["source_type"]],
+                        "source_title": item["title"],
+                        "source_url": item["source_url"],
+                    }, "ok"
+                last_status = f"audit_failed:{clean_text(audit.get('reason', ''))}"
+
+            if last_status != "copied_fragment" and not last_status.startswith("audit_failed"):
+                break
+            retry_note = (
+                f"предыдущий вариант отклонен ({last_status}); перепиши заметку иначе, "
+                "короче и своими словами, без переноса структуры и фраз источника"
+            )
+        return None, last_status
     except Exception as error:
         print(f"Ошибка модели для '{item['title']}': {error}", flush=True)
         return None, "model_error"
@@ -422,6 +437,13 @@ def main():
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
     stats["suitable"] = len(candidates)
+    if candidates:
+        print("Кандидаты после тематического отбора:", flush=True)
+        for item in candidates[:5]:
+            print(
+                f"  score={item['score']} source={item['source_type']} title={item['title']}",
+                flush=True,
+            )
     article = None
     for item in candidates:
         article, status = rewrite_one(item, item["body"])
