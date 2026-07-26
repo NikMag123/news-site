@@ -1,14 +1,17 @@
-import os
-import json
 import base64
+import json
+import os
 import re
-import requests
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
-from html import unescape
+from collections import Counter
 from datetime import datetime
+from html import unescape
 from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
 from openai import OpenAI
+
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GH_TOKEN = os.getenv("GH_TOKEN")
@@ -16,6 +19,8 @@ REPO = "NikMag123/news-site"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_NEWS_ON_SITE = 50
 MIN_SCORE = 4
+MIN_BODY_LENGTH = 350
+MAX_BODY_LENGTH = 9000
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -25,542 +30,404 @@ if not GH_TOKEN:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (compatible; JuristSochiNewsBot/1.0; +https://juristsochi.ru/)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 CORE_KEYWORDS = [
-    "недвиж", "квартир", "дом", "жиль", "жил",
-    "земл", "участок", "кадастр", "росреестр", "ипотек",
-    "аренд", "собственност", "долев", "многоквартир",
-    "капремонт", "перепланиров", "разрешение на строительство",
-    "строительств", "застройщик", "реконструкц", "новострой",
-    "рынок жилья", "ввод жилья", "сделк", "жк",
-    "дду", "дольщик", "самострой", "самовольн", "жкх",
-    "управляющ", "тсж", "снос", "права собственности",
-    "жилой комплекс", "земельн", "ипотечн", "арбитраж",
+    "недвиж", "квартир", "дом", "жиль", "земл", "участок", "кадастр",
+    "росреестр", "ипотек", "аренд", "собственност", "долев", "многоквартир",
+    "капремонт", "перепланиров", "разрешение на строительство", "строительств",
+    "застройщик", "реконструкц", "новострой", "рынок жилья", "ввод жилья",
+    "сделк", "жк", "дду", "дольщик", "самострой", "самовольн", "жкх",
+    "управляющ", "тсж", "снос", "жилой комплекс", "арбитраж",
 ]
 
-REGIONAL_KEYWORDS = [
-    "краснодар", "сочи", "кубан", "краснодарский край"
-]
-
+REGIONAL_KEYWORDS = ["краснодар", "сочи", "кубан", "краснодарский край"]
 FEDERAL_KEYWORDS = [
-    "российской федерации",
-    "федеральный закон",
-    "верховный суд",
-    "верховный суд российской федерации",
-    "конституционный суд российской федерации",
-    "правительство российской федерации",
-    "минстрой россии",
-    "росреестр",
-    "минстрой рф",
-    "пленум",
-    "президиум",
-    "обзор судебной практики",
+    "российской федерации", "федеральный закон", "верховный суд",
+    "конституционный суд", "правительство российской федерации", "минстрой",
+    "росреестр", "обзор судебной практики",
 ]
-
 IRRELEVANT_HINTS = [
-    "спорт", "культура", "кино", "театр", "концерт",
-    "погода", "туризм", "школ", "образован", "медицин",
-    "авар", "пожар", "кримин", "полици", "шоу",
-    "фестиваль", "ремонт дорог", "бензин", "зарплат",
-    "наличн", "политик", "отставк",
+    "спорт", "культура", "кино", "театр", "концерт", "погода", "туризм",
+    "школ", "образован", "медицин", "авар", "пожар", "кримин", "полици",
+    "фестиваль", "ремонт дорог", "бензин", "зарплат", "отставк",
 ]
-
 HARD_BLOCK_HINTS = [
-    "нормативных затрат",
-    "нормативные затраты",
-    "должностных окладов",
-    "бюджетных учреждений",
-    "государственных учреждений",
-    "исполнительных органов",
-    "министерства труда",
-    "социального развития",
-    "ветеринарии",
-    "финансов",
-    "бюджет",
-    "бюджетирование",
-    "казнач",
-    "оплаты труда",
+    "нормативных затрат", "должностных окладов", "бюджетных учреждений",
+    "государственных учреждений", "ветеринарии", "казнач", "оплаты труда",
 ]
-
-SOURCE_WEIGHTS = {
-    "vsrf": 4,
-    "rbc": 3,
-    "pravo": 2,
+SOURCE_WEIGHTS = {"vsrf": 4, "pravo": 3}
+SOURCE_NAMES = {
+    "vsrf": "Верховный Суд Российской Федерации",
+    "pravo": "Официальный интернет-портал правовой информации",
 }
 
-def clean_text(s):
-    return " ".join(unescape((s or "")).split()).strip()
+# These phrases usually signal a recommendation, forecast, or unsupported conclusion.
+FORBIDDEN_OUTPUT_PATTERNS = [
+    r"рекоменду[её]тся", r"стоит (?:купить|продать|влож|обратиться)",
+    r"удачное время", r"выгодн(?:о|ая)", r"перспективн", r"гарантир",
+    r"обязательно привед", r"может привести", r"восстановлени[ея] рынка",
+    r"шанс защитить", r"снизит риски", r"избежать (?:всех )?рисков",
+    r"юридическ(?:ая|ую) консультац", r"следите за изменениями",
+]
+
+
+def clean_text(value):
+    return " ".join(unescape(value or "").split()).strip()
+
 
 def has_any(text, words):
-    return any(w in text for w in words)
+    return any(word in text for word in words)
 
-def build_neutral_title(item, body):
-    text = (item.get("title", "") + " " + item.get("description", "") + " " + body).lower()
 
-    if has_any(text, ["самострой", "самовольн"]):
-        return "Спор о самовольной постройке"
-    if has_any(text, ["дду", "дольщик"]):
-        return "Вопросы защиты дольщиков"
-    if has_any(text, ["ипотек"]):
-        return "Споры по ипотеке и жилью"
-    if has_any(text, ["аренд"]):
-        return "Споры об аренде жилья"
-    if has_any(text, ["земл", "участок", "кадастр"]):
-        return "Споры о земельных участках"
-    if has_any(text, ["собственност"]):
-        return "Споры о праве собственности"
-    if has_any(text, ["застройщик", "новострой", "строительств"]):
-        return "Строительные споры и застройщик"
-    if has_any(text, ["жкх", "тсж", "управляющ"]):
-        return "Вопросы по управлению жильем"
+def words(text):
+    return re.findall(r"[а-яa-z0-9]+", (text or "").lower())
 
-    return "Юридический вопрос по недвижимости"
 
-def title_too_close(a, b):
-    a_words = {w for w in re.findall(r"[а-яa-z0-9]+", (a or "").lower()) if len(w) > 2}
-    b_words = {w for w in re.findall(r"[а-яa-z0-9]+", (b or "").lower()) if len(w) > 2}
-    if not a_words or not b_words:
-        return False
-    overlap = len(a_words & b_words) / max(len(a_words), len(b_words))
-    return overlap >= 0.6 or (a or "").lower() in (b or "").lower() or (b or "").lower() in (a or "").lower()
+def sentence_count(text):
+    return len([part for part in re.split(r"[.!?]+", text) if part.strip()])
 
-def extract_body_from_html(html):
+
+def has_long_copied_fragment(source, draft, n=6):
+    source_words = words(source)
+    draft_words = words(draft)
+    source_ngrams = {
+        tuple(source_words[index:index + n])
+        for index in range(len(source_words) - n + 1)
+    }
+    return any(
+        tuple(draft_words[index:index + n]) in source_ngrams
+        for index in range(len(draft_words) - n + 1)
+    )
+
+
+def source_url_is_article(source_type, url):
+    if source_type == "vsrf":
+        return bool(re.search(r"/(press_center/news|documents/(all|own))/\d+/?$", url))
+    return bool(url)
+
+
+def extract_body_from_html(html, source_type):
     soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.select("script, style, nav, header, footer, aside, form, noscript"):
+        tag.decompose()
 
-    selectors = [
-        "div.article__text",
-        "div.js-news-text",
-        "div[itemprop='articleBody']",
-        "article",
-        "section.article",
-        "div.article",
-    ]
+    selectors = {
+        "vsrf": ["div.js-news-text", "div[itemprop='articleBody']", "article"],
+        "pravo": ["div[itemprop='articleBody']", "article", "main"],
+    }.get(source_type, ["div[itemprop='articleBody']", "article", "main"])
 
     candidates = []
-
     for selector in selectors:
         for block in soup.select(selector):
             paragraphs = [
-                clean_text(p.get_text(" ", strip=True))
-                for p in block.find_all("p")
+                clean_text(paragraph.get_text(" ", strip=True))
+                for paragraph in block.find_all("p")
             ]
-            paragraphs = [p for p in paragraphs if len(p) > 20]
-
-            if paragraphs:
-                text = "\n\n".join(paragraphs)
-                if len(text) > 200:
-                    candidates.append(text)
-                    continue
-
-            text = clean_text(block.get_text(" ", strip=True))
-            if len(text) > 300:
+            paragraphs = [paragraph for paragraph in paragraphs if len(paragraph) >= 35]
+            text = "\n\n".join(paragraphs) if paragraphs else clean_text(block.get_text(" ", strip=True))
+            if len(text) >= MIN_BODY_LENGTH:
                 candidates.append(text)
 
-    if candidates:
-        return max(candidates, key=len)
+    if not candidates:
+        json_ld = soup.select("script[type='application/ld+json']")
+        for tag in json_ld:
+            try:
+                data = json.loads(tag.get_text(strip=True))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    text = clean_text(item.get("articleBody", ""))
+                    if len(text) >= MIN_BODY_LENGTH:
+                        candidates.append(text)
 
-    meta_selectors = [
-        ('meta[name="description"]', "content"),
-        ('meta[property="og:description"]', "content"),
-    ]
-
-    for selector, attr in meta_selectors:
-        tag = soup.select_one(selector)
-        if tag and tag.get(attr):
-            text = clean_text(tag.get(attr))
-            if text:
-                return text
-
-    return ""
-
-def fetch_page_body(url):
-    if not url:
+    if not candidates:
         return ""
+
+    # The longest candidate is normally the main article after navigation is removed.
+    return max(candidates, key=len)
+
+
+def fetch_page_body(url, source_type):
+    if not url or not source_url_is_article(source_type, url):
+        return "", "not_article_page"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        body = extract_body_from_html(resp.text)
-        return body
-    except Exception as e:
-        print(f"Ошибка загрузки страницы {url}: {e}", flush=True)
-        return ""
+        response = requests.get(url, headers=HEADERS, timeout=25)
+        response.raise_for_status()
+        body = extract_body_from_html(response.text, source_type)
+        if len(body) < MIN_BODY_LENGTH:
+            return "", "body_too_short"
+        return body[:MAX_BODY_LENGTH], "ok"
+    except requests.RequestException as error:
+        print(f"Ошибка загрузки страницы {url}: {error}", flush=True)
+        return "", "fetch_error"
+
 
 def fetch_rss_items(url, source_type):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-    except Exception as e:
-        print(f"Ошибка загрузки {url}: {e}", flush=True)
+        response = requests.get(url, headers=HEADERS, timeout=25)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+    except Exception as error:
+        print(f"Ошибка загрузки RSS {url}: {error}", flush=True)
         return []
 
     results = []
     for item in root.iter("item"):
         title = item.find("title")
-        desc = item.find("description")
+        description = item.find("description")
         link = item.find("link")
-
         title_text = clean_text(title.text if title is not None else "")
-        desc_text = clean_text(desc.text if desc is not None else "")
         link_text = clean_text(link.text if link is not None else "")
-
-        if not title_text:
-            continue
-
-        results.append({
-            "title": title_text,
-            "description": desc_text,
-            "source_type": source_type,
-            "source_url": link_text,
-        })
-
+        if title_text and link_text:
+            results.append({
+                "title": title_text,
+                "description": clean_text(description.text if description is not None else ""),
+                "source_type": source_type,
+                "source_url": link_text,
+            })
     return results
+
 
 def fetch_pravo():
     return fetch_rss_items("https://publication.pravo.gov.ru/api/rss?pageSize=200", "pravo")
 
-def fetch_vsrf():
-    pages = [
-        "https://vsrf.ru/",
-        "https://vsrf.ru/press_center/news/",
-        "https://vsrf.ru/documents/",
-    ]
 
+def fetch_vsrf():
+    pages = ["https://vsrf.ru/press_center/news/", "https://vsrf.ru/documents/"]
     results = []
     seen = set()
-
-    for url in pages:
+    for page_url in pages:
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=25)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-        except Exception as e:
-            print(f"Ошибка загрузки ВС РФ {url}: {e}", flush=True)
+            response = requests.get(page_url, headers=HEADERS, timeout=25)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+        except requests.RequestException as error:
+            print(f"Ошибка загрузки ВС РФ {page_url}: {error}", flush=True)
             continue
 
-        for a in soup.find_all("a", href=True):
-            href = clean_text(unescape(a["href"]))
-            if "/press_center/news/" not in href and "/documents/" not in href:
+        for anchor in soup.find_all("a", href=True):
+            source_url = urljoin(page_url, clean_text(unescape(anchor["href"])))
+            if not source_url_is_article("vsrf", source_url):
                 continue
-
-            title_text = clean_text(a.get_text(" ", strip=True))
-            if len(title_text) < 20:
-                continue
-
-            key = title_text.lower()
-            if key in seen:
+            title = clean_text(anchor.get_text(" ", strip=True))
+            key = source_url.lower()
+            if len(title) < 20 or key in seen:
                 continue
             seen.add(key)
-
             results.append({
-                "title": title_text,
+                "title": title,
                 "description": "",
                 "source_type": "vsrf",
-                "source_url": urljoin(url, href),
+                "source_url": source_url,
             })
-
     return results
 
-def fetch_rbc_kuban():
-    url = "https://kuban.rbc.ru/krasnodar/"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=25)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"Ошибка загрузки RBC Краснодар: {e}", flush=True)
-        return []
 
-    results = []
-    seen = set()
+def classify_item(title, description, body, source_type):
+    text = f"{title} {description} {body}".lower()
+    core_hits = sum(keyword in text for keyword in CORE_KEYWORDS)
+    region_hits = sum(keyword in text for keyword in REGIONAL_KEYWORDS)
+    federal_hits = sum(keyword in text for keyword in FEDERAL_KEYWORDS)
+    irrelevant_hits = sum(keyword in text for keyword in IRRELEVANT_HINTS)
+    hard_block_hits = sum(keyword in text for keyword in HARD_BLOCK_HINTS)
 
-    for a in soup.find_all("a", href=True):
-        href = clean_text(unescape(a["href"]))
-        if "/krasnodar/" not in href and "kuban.plus.rbc.ru/news/" not in href:
-            continue
+    if hard_block_hits and not core_hits and not region_hits and not federal_hits:
+        return False, 0, "hard_block"
+    if not core_hits:
+        return False, 0, "not_real_estate_or_construction"
 
-        title_text = clean_text(a.get_text(" ", strip=True))
-        if len(title_text) < 20:
-            continue
-
-        key = title_text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        results.append({
-            "title": title_text,
-            "description": "",
-            "source_type": "rbc",
-            "source_url": urljoin(url, href),
-        })
-
-    return results
-
-def classify_item(title, desc, source_type):
-    text = (title + " " + desc).lower()
-
-    core_hits = sum(1 for kw in CORE_KEYWORDS if kw in text)
-    region_hits = sum(1 for kw in REGIONAL_KEYWORDS if kw in text)
-    federal_hits = sum(1 for kw in FEDERAL_KEYWORDS if kw in text)
-    irrelevant_hits = sum(1 for kw in IRRELEVANT_HINTS if kw in text)
-    hard_block_hits = [kw for kw in HARD_BLOCK_HINTS if kw in text]
-    source_weight = SOURCE_WEIGHTS.get(source_type, 1)
-
-    reasons = []
-
-    if hard_block_hits and core_hits == 0 and region_hits == 0 and federal_hits == 0:
-        return False, 0, ["hard_block"]
-
-    if source_type == "rbc":
-        if core_hits == 0:
-            return False, 0, ["rbc_not_real_estate"]
-
-    elif source_type == "pravo":
-        if core_hits == 0:
-            return False, 0, ["pravo_not_real_estate"]
-
-    score = 0
-    score += core_hits * 3
-    score += region_hits * 3
-    score += federal_hits * 2
-    score += source_weight
-
-    if has_any(text, ["верховн", "пленум", "судебн", "разъяснен", "определен", "решени"]):
+    score = core_hits * 3 + region_hits * 3 + federal_hits * 2 + SOURCE_WEIGHTS[source_type]
+    if has_any(text, ["верховн", "судебн", "разъяснен", "определен", "решени"]):
         score += 2
-
-    if has_any(text, ["ипотек", "новостро", "застройщ", "кадастр", "росреестр", "земл", "аренд", "капремонт"]):
-        score += 1
-
     if irrelevant_hits:
         score -= 3
-
-    reasons.extend([
-        f"core:{core_hits}",
-        f"region:{region_hits}",
-        f"federal:{federal_hits}",
-        f"source:{source_type}",
-    ])
-
-    if irrelevant_hits:
-        reasons.append("irrelevant")
-    if hard_block_hits:
-        reasons.append("hard_block_hint")
-
     if score < MIN_SCORE:
-        return False, score, reasons
+        return False, score, "low_relevance_score"
+    return True, score, "ok"
 
-    return True, score, reasons
 
 def get_existing_news():
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
-    headers = {
-        "Authorization": f"Bearer {GH_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
+    headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
     try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code != 200:
-            return [], ""
+        response = requests.get(url, headers=headers, timeout=20)
+        if response.status_code != 200:
+            return []
+        data = response.json()
+        return json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+    except Exception as error:
+        print(f"Ошибка чтения news.json: {error}", flush=True)
+        return []
 
-        data = resp.json()
-        if "content" in data:
-            content = base64.b64decode(data["content"]).decode("utf-8")
-            return json.loads(content), data.get("sha", "")
-    except Exception as e:
-        print(f"Ошибка чтения news.json: {e}", flush=True)
 
-    return [], ""
+def ask_model(messages):
+    result = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=0,
+        max_tokens=1400,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(result.choices[0].message.content.strip())
 
-def rewrite_one(item):
-    desc = item.get("description", "") or ""
-    body = ""
-    if item.get("source_url"):
-        body = fetch_page_body(item["source_url"])
 
-    if len(body) < 120:
-        body = desc
-
-    if len(body) > 7000:
-        body = body[:7000] + " ..."
-
+def create_draft(item, body):
     prompt = f"""
-    Ты — юридический редактор сайта по недвижимости и строительству в России.
+Ты готовишь короткую информационную заметку для российского сайта о недвижимости и строительстве.
 
-    Сделай не сухой пересказ, а короткий живой юридический комментарий к материалу.
+Используй ТОЛЬКО факты из исходного материала. Не используй общие знания.
+Не давай рекомендации, прогнозы, оценку выгодности сделки, обещания результата в суде или юридические консультации.
+Не добавляй регионы, даты, цифры, законы, участников спора или последствия, которых нет в материале.
+Не копируй фразы из источника длиннее четырех слов подряд.
+Если фактов недостаточно для содержательной заметки, верни approved=false.
 
+Исходный заголовок: {item['title']}
 Исходный материал:
-Заголовок: {item["title"]}
-Короткое описание: {desc}
-Полный текст статьи: {body}
+{body}
 
-    Правила:
-    1. Не выдумывай факты, цифры, регионы, последствия и источники.
-    2. Придумай новый заголовок, не копируй исходный заголовок дословно и не повторяй его почти полностью.
-    3. Не делай текст рекламным.
-    4. Не используй канцелярский стиль.
-    5. Можно добавить только нейтральное пояснение и практический смысл.
-6. Текст должен состоять из 4 коротких фраз:
-   - что произошло;
-   - что это значит на практике;
-   - кому это может быть важно;
-   - какой практический вывод можно сделать.
-7. Если тема слабая, не усиливай её искусственно, а пиши сдержанно.
-8. Сохраняй смысл исходника.
-9. Верни только JSON без markdown и без пояснений.
-
-Формат ответа строго такой:
+Верни только JSON:
 {{
-  "title": "...",
-  "text": "..."
+  "approved": true,
+  "title": "новый нейтральный заголовок без сенсационности",
+  "text": "от 3 до 10 содержательных предложений; только изложение фактов и максимум один нейтральный вывод, прямо следующий из фактов",
+  "facts": ["3-8 кратких проверяемых фактов из исходного материала"]
 }}
 """
+    return ask_model([
+        {"role": "system", "content": "Ты аккуратный редактор. Возвращай только JSON."},
+        {"role": "user", "content": prompt},
+    ])
 
+
+def audit_draft(item, body, draft):
+    prompt = f"""
+Проверь черновик информационной заметки по исходному материалу.
+Одобри только если каждый существенный факт черновика прямо подтверждается исходным текстом.
+Отклони, если есть совет, прогноз, обещание результата, неподтвержденный вывод, добавленный регион, дата, цифра, участник или правовое последствие.
+Отклони, если текст почти копирует исходник.
+
+Исходный материал:
+{body}
+
+Черновик:
+Заголовок: {draft.get('title', '')}
+Текст: {draft.get('text', '')}
+Факты: {json.dumps(draft.get('facts', []), ensure_ascii=False)}
+
+Верни только JSON: {{"approved": true, "reason": "ok"}}
+или {{"approved": false, "reason": "краткая причина"}}.
+"""
+    return ask_model([
+        {"role": "system", "content": "Ты строгий фактчекер юридических новостей. Возвращай только JSON."},
+        {"role": "user", "content": prompt},
+    ])
+
+
+def validate_draft(body, draft):
+    title = clean_text(draft.get("title", ""))
+    text = clean_text(draft.get("text", ""))
+    facts = draft.get("facts", [])
+    if not draft.get("approved") or not title or not text or not isinstance(facts, list):
+        return False, "model_rejected_or_empty"
+    if not 3 <= sentence_count(text) <= 10:
+        return False, "wrong_sentence_count"
+    if len(text) < 280 or len(text) > 1800:
+        return False, "wrong_text_length"
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in FORBIDDEN_OUTPUT_PATTERNS):
+        return False, "forbidden_advice_or_forecast"
+    if has_long_copied_fragment(body, f"{title} {text}"):
+        return False, "copied_fragment"
+    return True, "ok"
+
+
+def rewrite_one(item, body):
     try:
-        result = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ты аккуратный юридический редактор. Возвращай только JSON."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.2,
-            max_tokens=1200,
-            response_format={"type": "json_object"}
-        )
-
-        raw = result.choices[0].message.content.strip()
-        parsed = json.loads(raw)
-
-        title = clean_text(parsed.get("title", ""))
-        text = clean_text(parsed.get("text", ""))
-
-        if not title or not text:
-            raise ValueError("Empty title/text from model")
-
-        if title_too_close(title, item["title"]):
-            title = build_neutral_title(item, body)
-
+        draft = create_draft(item, body)
+        valid, reason = validate_draft(body, draft)
+        if not valid:
+            return None, reason
+        audit = audit_draft(item, body, draft)
+        if not audit.get("approved"):
+            return None, f"audit_failed:{clean_text(audit.get('reason', ''))}"
         return {
-            "source": "law" if item["source_type"] in ("pravo", "vsrf") else "news",
-            "title": title,
-            "text": text,
+            "source": "law",
+            "title": clean_text(draft["title"]),
+            "text": clean_text(draft["text"]),
             "date": datetime.now().strftime("%Y-%m-%d"),
+            "source_name": SOURCE_NAMES[item["source_type"]],
             "source_title": item["title"],
-            "source_url": item.get("source_url", ""),
-        }
+            "source_url": item["source_url"],
+        }, "ok"
+    except Exception as error:
+        print(f"Ошибка модели для '{item['title']}': {error}", flush=True)
+        return None, "model_error"
 
-    except Exception as e:
-        print(f"Ошибка GPT для '{item['title']}': {e}", flush=True)
-
-        fallback_text = clean_text(desc or body)
-        if not fallback_text:
-            fallback_text = f"Поступил новый материал: {clean_text(item['title'])}"
-
-        return {
-            "source": "law" if item["source_type"] in ("pravo", "vsrf") else "news",
-            "title": build_neutral_title(item, body),
-            "text": fallback_text,
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "source_title": item["title"],
-            "source_url": item.get("source_url", ""),
-        }
 
 def save_to_github(news_list):
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
-    headers = {
-        "Authorization": f"Bearer {GH_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
-    content_json = json.dumps(news_list, ensure_ascii=False, indent=2)
-    encoded = base64.b64encode(content_json.encode("utf-8")).decode("utf-8")
-
-    sha = ""
+    headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+    content = base64.b64encode(json.dumps(news_list, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8")
+    payload = {"message": "Update news", "content": content}
     try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code == 200:
-            sha = resp.json().get("sha", "")
-    except Exception:
-        pass
-
-    payload = {
-        "message": "Update news",
-        "content": encoded,
-    }
-
-    if sha:
-        payload["sha"] = sha
-
-    resp = requests.put(url, headers=headers, json=payload, timeout=20)
-
-    if resp.status_code in (200, 201):
+        current = requests.get(url, headers=headers, timeout=20)
+        if current.status_code == 200:
+            payload["sha"] = current.json().get("sha", "")
+        response = requests.put(url, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
         print("GitHub updated", flush=True)
-    else:
-        print(f"GitHub error: {resp.status_code} {resp.text}", flush=True)
+    except requests.RequestException as error:
+        print(f"GitHub error: {error}", flush=True)
+
 
 def main():
-    existing, _ = get_existing_news()
-
-    existing_titles = {
-        n.get("source_title", "").lower()
-        for n in existing
-        if n.get("source_title")
-    }
-
-    print(f"На сайте сейчас: {len(existing)}", flush=True)
-
-    laws = fetch_pravo()
-    vsrf = fetch_vsrf()
-
-    print(f"Найдено: pravo={len(laws)} vsrf={len(vsrf)}", flush=True)
-
+    existing = get_existing_news()
+    existing_urls = {item.get("source_url", "") for item in existing if item.get("source_url")}
+    stats = Counter()
+    raw_items = fetch_vsrf() + fetch_pravo()
+    stats["found"] = len(raw_items)
     candidates = []
-    for item in (vsrf + laws):
-        title_key = item["title"].lower()
-        if title_key in existing_titles:
+
+    for item in raw_items:
+        if item["source_url"] in existing_urls:
+            stats["already_published"] += 1
             continue
-        ok, score, reasons = classify_item(item["title"], item.get("description", ""), item["source_type"])
+        body, status = fetch_page_body(item["source_url"], item["source_type"])
+        if status != "ok":
+            stats[status] += 1
+            continue
+        ok, score, reason = classify_item(item["title"], item["description"], body, item["source_type"])
         if not ok:
+            stats[reason] += 1
             continue
+        item["body"] = body
         item["score"] = score
-        item["reasons"] = reasons
         candidates.append(item)
 
-    if not candidates:
-        print("Нет новых материалов", flush=True)
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    stats["suitable"] = len(candidates)
+    article = None
+    for item in candidates:
+        article, status = rewrite_one(item, item["body"])
+        if article:
+            break
+        stats[status] += 1
+
+    print("Статистика обработки:", flush=True)
+    for key, value in sorted(stats.items()):
+        print(f"  {key}: {value}", flush=True)
+
+    if not article:
+        print("Нет материала, прошедшего проверку. news.json не изменен.", flush=True)
         return
 
-    candidates.sort(
-        key=lambda x: (
-            x["score"],
-            2 if x["source_type"] == "vsrf" else 1 if x["source_type"] == "pravo" else 0
-        ),
-        reverse=True
-    )
+    save_to_github([article] + existing[:MAX_NEWS_ON_SITE - 1])
+    print(f"Опубликовано: {article['title']}", flush=True)
 
-    best = candidates[0]
-    print(
-        f"Выбрано: score={best['score']} source={best['source_type']} title={best['title']}",
-        flush=True
-    )
-    print(f"Причины: {', '.join(best['reasons'])}", flush=True)
-
-    article = rewrite_one(best)
-    updated = [article] + existing
-    updated = updated[:MAX_NEWS_ON_SITE]
-
-    save_to_github(updated)
-    print("Done!", flush=True)
 
 if __name__ == "__main__":
     main()
