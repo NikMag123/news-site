@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime
@@ -40,7 +41,10 @@ CORE_KEYWORDS = [
     "капремонт", "перепланиров", "разрешение на строительство", "строительств",
     "застройщик", "реконструкц", "новострой", "рынок жилья", "ввод жилья",
     "сделк", "жк", "дду", "дольщик", "самострой", "самовольн", "жкх",
-    "управляющ", "тсж", "снос", "жилой комплекс", "арбитраж",
+    "управляющ", "тсж", "снос", "жилой комплекс", "арбитраж", "подряд",
+    "сервитут", "градостро", "разрешенн", "охранн", "культурн наслед",
+    "гараж", "земли сельскохозяйственного назначения", "изъяти", "залог",
+    "банкротств", "аукцион", "торги", "нестационарн",
 ]
 
 REGIONAL_KEYWORDS = ["краснодар", "сочи", "кубан", "краснодарский край"]
@@ -168,12 +172,18 @@ def fetch_page_body(url, source_type):
 
 
 def fetch_rss_items(url, source_type):
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=25)
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-    except Exception as error:
-        print(f"Ошибка загрузки RSS {url}: {error}", flush=True)
+    root = None
+    for attempt in range(1, 3):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=40)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            break
+        except Exception as error:
+            print(f"Ошибка загрузки RSS {url}, попытка {attempt}/2: {error}", flush=True)
+            if attempt == 1:
+                time.sleep(3)
+    if root is None:
         return []
 
     results = []
@@ -198,7 +208,9 @@ def fetch_pravo():
 
 
 def fetch_vsrf():
-    pages = ["https://vsrf.ru/press_center/news/", "https://vsrf.ru/documents/"]
+    # The category pages load entries dynamically. The current materials are
+    # present in the server-rendered markup of the main page.
+    pages = ["https://vsrf.ru/"]
     results = []
     seen = set()
     for page_url in pages:
