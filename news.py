@@ -13,13 +13,12 @@ import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GH_TOKEN = os.getenv("GH_TOKEN")
 REPO = "NikMag123/news-site"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_NEWS_ON_SITE = 50
-MIN_SCORE = 4
+MIN_SCORE = 8
 MIN_BODY_LENGTH = 250
 MAX_BODY_LENGTH = 9000
 COPY_FRAGMENT_WORDS = 12
@@ -36,40 +35,63 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-CORE_KEYWORDS = [
-    "недвиж", "квартир", "дом", "жиль", "земл", "участок", "кадастр",
+# ---------------------------------------------------------------------------
+# Ключевые слова
+# ---------------------------------------------------------------------------
+
+# Узкие маркеры темы. Попадание ХОТЯ БЫ ОДНОГО обязательно для прохода.
+TOPIC_KEYWORDS = [
+    "недвиж", "квартир", "дом ", "жиль", "земл", "участок", "кадастр",
     "росреестр", "ипотек", "аренд", "собственност", "долев", "многоквартир",
     "капремонт", "перепланиров", "разрешение на строительство", "строительств",
     "застройщик", "реконструкц", "новострой", "рынок жилья", "ввод жилья",
-    "сделк", "жк", "дду", "дольщик", "самострой", "самовольн", "жкх",
-    "управляющ", "тсж", "снос", "жилой комплекс", "арбитраж", "подряд",
-    "сервитут", "градостро", "разрешенн", "охранн", "культурн наслед",
-    "гараж", "земли сельскохозяйственного назначения", "изъяти", "залог",
-    "банкротств", "аукцион", "торги", "нестационарн",
+    "жк ", "дду", "дольщик", "самострой", "самовольн", "жкх",
+    "управляющ", "тсж", "снос", "жилой комплекс", "подряд",
+    "сервитут", "градостро", "разрешенн", "охранн зон", "культурн наслед",
+    "гараж", "земли сельскохозяйственного назначения", "нестационарн",
+    "дизайн интерьер", "отделк", "архитектур", "проектиров",
+    "риэлтор", "риелтор", "инженерн",
+]
+
+# Юридический контекст. Повышает оценку, но САМ ПО СЕБЕ проход не даёт.
+CONTEXT_KEYWORDS = [
+    "банкротств", "залог", "торги", "аукцион", "арбитраж", "изъяти",
+    "обременен", "регистраци прав", "сделк",
 ]
 
 REGIONAL_KEYWORDS = ["краснодар", "сочи", "кубан", "краснодарский край"]
+
 FEDERAL_KEYWORDS = [
     "российской федерации", "федеральный закон", "верховный суд",
     "конституционный суд", "правительство российской федерации", "минстрой",
     "росреестр", "обзор судебной практики",
 ]
+
 IRRELEVANT_HINTS = [
-    "спорт", "культура", "кино", "театр", "концерт", "погода", "туризм",
+    "спорт", "культур", "кино", "театр", "концерт", "погода", "туризм",
     "школ", "образован", "медицин", "авар", "пожар", "кримин", "полици",
     "фестиваль", "ремонт дорог", "бензин", "зарплат", "отставк",
 ]
+
+# Явные маркеры ЧУЖИХ тем (судебная реформа, кадры, авто).
+OFF_TOPIC_HINTS = [
+    "судебн департамент", "организационн обеспеч", "утрат доверия",
+    "военн суд", "госслуж", "чиновник", "финансово-хозяйствен",
+    "автомобил", "транспорт",
+]
+
 HARD_BLOCK_HINTS = [
     "нормативных затрат", "должностных окладов", "бюджетных учреждений",
     "государственных учреждений", "ветеринарии", "казнач", "оплаты труда",
 ]
+
 SOURCE_WEIGHTS = {"vsrf": 4, "pravo": 3}
 SOURCE_NAMES = {
     "vsrf": "Верховный Суд Российской Федерации",
     "pravo": "Официальный интернет-портал правовой информации",
 }
 
-# These phrases usually signal a recommendation, forecast, or unsupported conclusion.
+# Фразы, которые сигнализируют рекомендацию, прогноз или неподтверждённый вывод.
 FORBIDDEN_OUTPUT_PATTERNS = [
     r"рекоменду[её]тся", r"стоит (?:купить|продать|влож|обратиться)",
     r"удачное время", r"выгодн(?:о|ая)", r"перспективн", r"гарантир",
@@ -78,6 +100,10 @@ FORBIDDEN_OUTPUT_PATTERNS = [
     r"юридическ(?:ая|ую) консультац", r"следите за изменениями",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
 
 def clean_text(value):
     return " ".join(unescape(value or "").split()).strip()
@@ -108,6 +134,10 @@ def has_long_copied_fragment(source, draft, n=COPY_FRAGMENT_WORDS):
     )
 
 
+# ---------------------------------------------------------------------------
+# Загрузка и извлечение текста
+# ---------------------------------------------------------------------------
+
 def source_url_is_article(source_type, url):
     if source_type == "vsrf":
         return bool(re.search(r"/(press_center/news|documents/(all|own))/\d+/?$", url))
@@ -120,7 +150,11 @@ def extract_body_from_html(html, source_type):
         tag.decompose()
 
     selectors = {
-        "vsrf": ["div.vs-content div.vs-text", "div.js-news-text", "div.news-detail", "div[itemprop='articleBody']", "article", "main"],
+        "vsrf": [
+            "div.vs-content div.vs-text", "div.js-news-text",
+            "div.news-detail", "div[itemprop='articleBody']",
+            "article", "main",
+        ],
         "pravo": ["div[itemprop='articleBody']", "article", "main"],
     }.get(source_type, ["div[itemprop='articleBody']", "article", "main"])
 
@@ -152,8 +186,6 @@ def extract_body_from_html(html, source_type):
 
     if not candidates:
         return ""
-
-    # The longest candidate is normally the main article after navigation is removed.
     return max(candidates, key=len)
 
 
@@ -184,6 +216,7 @@ def fetch_rss_items(url, source_type):
             print(f"Ошибка загрузки RSS {url}, попытка {attempt}/2: {error}", flush=True)
             if attempt == 1:
                 time.sleep(3)
+
     if root is None:
         return []
 
@@ -209,8 +242,6 @@ def fetch_pravo():
 
 
 def fetch_vsrf():
-    # The category pages load entries dynamically. The current materials are
-    # present in the server-rendered markup of the main page.
     pages = ["https://vsrf.ru/"]
     results = []
     seen = set()
@@ -241,28 +272,52 @@ def fetch_vsrf():
     return results
 
 
+# ---------------------------------------------------------------------------
+# Тематический отбор
+# ---------------------------------------------------------------------------
+
 def classify_item(title, description, body, source_type):
     text = f"{title} {description} {body}".lower()
-    core_hits = sum(keyword in text for keyword in CORE_KEYWORDS)
+    topic_hits = sum(keyword in text for keyword in TOPIC_KEYWORDS)
+    context_hits = sum(keyword in text for keyword in CONTEXT_KEYWORDS)
     region_hits = sum(keyword in text for keyword in REGIONAL_KEYWORDS)
     federal_hits = sum(keyword in text for keyword in FEDERAL_KEYWORDS)
     irrelevant_hits = sum(keyword in text for keyword in IRRELEVANT_HINTS)
+    off_topic_hits = sum(keyword in text for keyword in OFF_TOPIC_HINTS)
     hard_block_hits = sum(keyword in text for keyword in HARD_BLOCK_HINTS)
 
-    if hard_block_hits and not core_hits and not region_hits and not federal_hits:
+    if hard_block_hits and not topic_hits:
         return False, 0, "hard_block"
-    if not core_hits:
+
+    # Обязательное условие: материал вообще про недвижимость / строительство.
+    if not topic_hits:
         return False, 0, "not_real_estate_or_construction"
 
-    score = core_hits * 3 + region_hits * 3 + federal_hits * 2 + SOURCE_WEIGHTS[source_type]
+    # Слабая тема + явные маркеры чужой темы = отклон.
+    if off_topic_hits and topic_hits <= 1:
+        return False, 0, "off_topic_subject"
+
+    score = (
+        topic_hits * 3
+        + context_hits * 1
+        + region_hits * 3
+        + federal_hits * 2
+        + SOURCE_WEIGHTS[source_type]
+    )
     if has_any(text, ["верховн", "судебн", "разъяснен", "определен", "решени"]):
         score += 2
     if irrelevant_hits:
         score -= 3
+    if off_topic_hits:
+        score -= 2
     if score < MIN_SCORE:
         return False, score, "low_relevance_score"
     return True, score, "ok"
 
+
+# ---------------------------------------------------------------------------
+# GitHub
+# ---------------------------------------------------------------------------
 
 def get_existing_news():
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
@@ -277,6 +332,28 @@ def get_existing_news():
         print(f"Ошибка чтения news.json: {error}", flush=True)
         return []
 
+
+def save_to_github(news_list):
+    url = f"https://api.github.com/repos/{REPO}/contents/news.json"
+    headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+    content = base64.b64encode(
+        json.dumps(news_list, ensure_ascii=False, indent=2).encode("utf-8")
+    ).decode("utf-8")
+    payload = {"message": "Update news", "content": content}
+    try:
+        current = requests.get(url, headers=headers, timeout=20)
+        if current.status_code == 200:
+            payload["sha"] = current.json().get("sha", "")
+        response = requests.put(url, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        print("GitHub updated", flush=True)
+    except requests.RequestException as error:
+        print(f"GitHub error: {error}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Модель: генерация, аудит, валидация
+# ---------------------------------------------------------------------------
 
 def ask_model(messages, temperature=0):
     result = client.chat.completions.create(
@@ -293,14 +370,13 @@ def create_draft(item, body, retry_note=""):
     retry_instruction = f"\nДополнительное требование: {retry_note}\n" if retry_note else ""
     prompt = f"""
 Ты готовишь короткую информационную заметку для российского сайта о недвижимости и строительстве.
-
 Используй ТОЛЬКО факты из исходного материала. Не используй общие знания.
 Не давай рекомендации, прогнозы, оценку выгодности сделки, обещания результата в суде или юридические консультации.
 Не добавляй регионы, даты, цифры, законы, участников спора или последствия, которых нет в материале.
+Если в исходнике есть выводы суда, оценочные суждения, слова о «важности», «балансе интересов», «доверии» — НЕ переноси их. Излагай только процессуальные факты: кто, к кому, какой иск/спор, что решили инстанции, куда направлено дело.
 Не копируй предложения или крупные фрагменты исходника. Устойчивые названия органов, актов и юридических терминов допустимы.
 Если фактов недостаточно для содержательной заметки, верни approved=false.
 {retry_instruction}
-
 Исходный заголовок: {item['title']}
 Исходный материал:
 {body}
@@ -309,7 +385,7 @@ def create_draft(item, body, retry_note=""):
 {{
   "approved": true,
   "title": "новый нейтральный заголовок без сенсационности",
-  "text": "от 3 до 10 содержательных предложений; только изложение фактов и максимум один нейтральный вывод, прямо следующий из фактов",
+  "text": "от 3 до 10 предложений; только изложение фактов, БЕЗ единого вывода, оценки или интерпретации",
   "facts": ["3-8 кратких проверяемых фактов из исходного материала"]
 }}
 """
@@ -416,30 +492,19 @@ def rewrite_one(item, body):
         return None, "model_error"
 
 
-def save_to_github(news_list):
-    url = f"https://api.github.com/repos/{REPO}/contents/news.json"
-    headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
-    content = base64.b64encode(json.dumps(news_list, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8")
-    payload = {"message": "Update news", "content": content}
-    try:
-        current = requests.get(url, headers=headers, timeout=20)
-        if current.status_code == 200:
-            payload["sha"] = current.json().get("sha", "")
-        response = requests.put(url, headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
-        print("GitHub updated", flush=True)
-    except requests.RequestException as error:
-        print(f"GitHub error: {error}", flush=True)
-
+# ---------------------------------------------------------------------------
+# Основной конвейер
+# ---------------------------------------------------------------------------
 
 def main():
     existing = get_existing_news()
     existing_urls = {item.get("source_url", "") for item in existing if item.get("source_url")}
     stats = Counter()
+
     raw_items = fetch_vsrf() + fetch_pravo()
     stats["found"] = len(raw_items)
-    candidates = []
 
+    candidates = []
     for item in raw_items:
         if item["source_url"] in existing_urls:
             stats["already_published"] += 1
@@ -458,6 +523,7 @@ def main():
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
     stats["suitable"] = len(candidates)
+
     if candidates:
         print("Кандидаты после тематического отбора:", flush=True)
         for item in candidates[:5]:
@@ -465,6 +531,7 @@ def main():
                 f"  score={item['score']} source={item['source_type']} title={item['title']}",
                 flush=True,
             )
+
     article = None
     for item in candidates:
         article, status = rewrite_one(item, item["body"])
