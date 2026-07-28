@@ -194,7 +194,7 @@ def fetch_page_body(url, source_type):
     if not url or not source_url_is_article(source_type, url):
         return "", "not_article_page"
     try:
-        response = requests.get(url, headers=HEADERS, timeout=25)
+        response = requests.get(url, headers=HEADERS, timeout=50)
         response.raise_for_status()
         body = extract_body_from_html(response.text, source_type)
         if len(body) < MIN_BODY_LENGTH:
