@@ -71,7 +71,6 @@ IRRELEVANT_HINTS = [
     "фестиваль", "ремонт дорог", "бензин", "зарплат", "отставк",
 ]
 
-# Мягкие маркеры чужих тем: блокируют только при слабой теме (topic_hits <= 1).
 OFF_TOPIC_HINTS = [
     "судебн департамент", "организационн обеспеч", "военн суд",
     "госслуж", "чиновник", "финансово-хозяйствен",
@@ -79,8 +78,6 @@ OFF_TOPIC_HINTS = [
     "соцвыплат", "военнослужащ", "погибш", "пенсии", "алимент", "развод", "опек",
 ]
 
-# ЖЁСТКИЕ маркеры: блок ВСЕГДА, даже если в тексте есть слова про недвижимость
-# (в обзорах по коррупции недвижимость фигурирует лишь как объект конфискации).
 HARD_OFF_TOPIC_HINTS = [
     "коррупц", "антикоррупц", "противодействи", "утрат доверия",
     "сведений о доходах", "декларац", "взятк",
@@ -130,12 +127,12 @@ def has_long_copied_fragment(source, draft, n=COPY_FRAGMENT_WORDS):
     source_words = words(source)
     draft_words = words(draft)
     source_ngrams = {
-        tuple(source_words[index:index + n])
-        for index in range(len(source_words) - n + 1)
+        tuple(source_words[i:i + n])
+        for i in range(len(source_words) - n + 1)
     }
     return any(
-        tuple(draft_words[index:index + n]) in source_ngrams
-        for index in range(len(draft_words) - n + 1)
+        tuple(draft_words[i:i + n]) in source_ngrams
+        for i in range(len(draft_words) - n + 1)
     )
 
 
@@ -167,8 +164,8 @@ def extract_body_from_html(html, source_type):
     for selector in selectors:
         for block in soup.select(selector):
             paragraphs = [
-                clean_text(paragraph.get_text(" ", strip=True))
-                for paragraph in block.find_all("p")
+                clean_text(p.get_text(" ", strip=True))
+                for p in block.find_all("p")
             ]
             paragraphs = [p for p in paragraphs if len(p) >= 35]
             text = "\n\n".join(paragraphs) if paragraphs else clean_text(block.get_text(" ", strip=True))
@@ -176,8 +173,7 @@ def extract_body_from_html(html, source_type):
                 candidates.append(text)
 
     if not candidates:
-        json_ld = soup.select("script[type='application/ld+json']")
-        for tag in json_ld:
+        for tag in soup.select("script[type='application/ld+json']"):
             try:
                 data = json.loads(tag.get_text(strip=True))
             except (json.JSONDecodeError, TypeError):
@@ -287,26 +283,21 @@ def fetch_vsrf():
 
 def classify_item(title, description, body, source_type):
     text = f"{title} {description} {body}".lower()
-    topic_hits = sum(keyword in text for keyword in TOPIC_KEYWORDS)
-    context_hits = sum(keyword in text for keyword in CONTEXT_KEYWORDS)
-    region_hits = sum(keyword in text for keyword in REGIONAL_KEYWORDS)
-    federal_hits = sum(keyword in text for keyword in FEDERAL_KEYWORDS)
-    irrelevant_hits = sum(keyword in text for keyword in IRRELEVANT_HINTS)
-    off_topic_hits = sum(keyword in text for keyword in OFF_TOPIC_HINTS)
-    hard_off_topic_hits = sum(keyword in text for keyword in HARD_OFF_TOPIC_HINTS)
-    hard_block_hits = sum(keyword in text for keyword in HARD_BLOCK_HINTS)
+    topic_hits = sum(k in text for k in TOPIC_KEYWORDS)
+    context_hits = sum(k in text for k in CONTEXT_KEYWORDS)
+    region_hits = sum(k in text for k in REGIONAL_KEYWORDS)
+    federal_hits = sum(k in text for k in FEDERAL_KEYWORDS)
+    irrelevant_hits = sum(k in text for k in IRRELEVANT_HINTS)
+    off_topic_hits = sum(k in text for k in OFF_TOPIC_HINTS)
+    hard_off_hits = sum(k in text for k in HARD_OFF_TOPIC_HINTS)
+    hard_block_hits = sum(k in text for k in HARD_BLOCK_HINTS)
 
-    # Жёсткий блок: коррупция / утрата доверия / декларации — отклон ВСЕГДА,
-    # даже если в примерах фигурирует конфискованная недвижимость.
-    if hard_off_topic_hits:
+    if hard_off_hits:
         return False, 0, "off_topic_hard"
-
     if hard_block_hits and not topic_hits:
         return False, 0, "hard_block"
-
     if not topic_hits:
         return False, 0, "not_real_estate_or_construction"
-
     if off_topic_hits and topic_hits <= 1:
         return False, 0, "off_topic_subject"
 
@@ -365,7 +356,7 @@ def save_to_github(news_list):
 
 
 # ---------------------------------------------------------------------------
-# Модель: генерация, аудит, валидация
+# Модель
 # ---------------------------------------------------------------------------
 
 def ask_model(messages, temperature=0):
@@ -387,7 +378,7 @@ def create_draft(item, body, retry_note=""):
 Не давай рекомендации, прогнозы, оценку выгодности сделки, обещания результата в суде или юридические консультации.
 Не добавляй регионы, даты, цифры, законы, участников спора или последствия, которых нет в материале.
 Если в исходнике есть выводы суда, оценочные суждения, слова о «важности», «балансе интересов», «доверии» — НЕ переноси их. Излагай только процессуальные факты: кто, к кому, какой иск/спор, что решили инстанции, куда направлено дело.
-АНТИКОПИРОВАНИЕ: НЕ используй ни одной последовательности из 6 и более слов подряд из исходника. Полностью меняй структуру и порядок предложений, а не только отдельные слова. Устойчивые названия органов, актов и терминов допустимы, но целые обороты источника — нет.
+АНТИКОПИРОВАНИЕ: НЕ используй ни одной последовательности из 6 и более слов подряд из исходника. Полностью меняй структуру и порядок предложений, а не только отдельные слова.
 Если фактов недостаточно для содержательной заметки, верни approved=false.
 {retry_instruction}
 Исходный заголовок: {item['title']}
@@ -463,11 +454,52 @@ def validate_draft(body, draft):
         return False, "wrong_sentence_count"
     if len(text) < 280 or len(text) > 1800:
         return False, "wrong_text_length"
-    if any(re.search(pattern, text, re.IGNORECASE) for pattern in FORBIDDEN_OUTPUT_PATTERNS):
+    if any(re.search(p, text, re.IGNORECASE) for p in FORBIDDEN_OUTPUT_PATTERNS):
         return False, "forbidden_advice_or_forecast"
     if has_long_copied_fragment(body, f"{title} {text}"):
         return False, "copied_fragment"
     return True, "ok"
+
+
+def check_duplicate(article, existing_news):
+    """Проверяет, не дублирует ли заметка уже опубликованную по существу."""
+    if not existing_news:
+        return False, "ok"
+
+    published = []
+    for item in existing_news[:30]:
+        t = item.get("title", "")
+        x = item.get("text", "")[:200]
+        published.append(f"- {t}: {x}")
+    published_block = "\n".join(published)
+
+    prompt = f"""
+Ты проверяешь, не дублирует ли новая заметка какую-то из уже опубликованных ПО СУЩЕСТВУ.
+
+Дубль = то же самое дело, спор или событие: те же стороны, те же обстоятельства, та же сумма, тот же предмет спора.
+НЕ дубль = просто похожая тема (например, обе про ЖКХ, но разные дела и разные стороны).
+
+Новая заметка:
+Заголовок: {article['title']}
+Текст: {article['text']}
+
+Уже опубликованные:
+{published_block}
+
+Верни только JSON:
+{{"duplicate": true, "reason": "какая именно опубликованная новость и почему это то же дело"}}
+или
+{{"duplicate": false, "reason": "ok"}}
+"""
+    try:
+        result = ask_model([
+            {"role": "system", "content": "Ты проверяешь дубли. Возвращай только JSON."},
+            {"role": "user", "content": prompt},
+        ])
+        return bool(result.get("duplicate")), clean_text(result.get("reason", ""))
+    except Exception as error:
+        print(f"Ошибка проверки дублей: {error}", flush=True)
+        return False, "check_error"
 
 
 def rewrite_one(item, body):
@@ -533,7 +565,9 @@ def main():
         if status != "ok":
             stats[status] += 1
             continue
-        ok, score, reason = classify_item(item["title"], item["description"], body, item["source_type"])
+        ok, score, reason = classify_item(
+            item["title"], item["description"], body, item["source_type"]
+        )
         if not ok:
             stats[reason] += 1
             continue
@@ -541,7 +575,7 @@ def main():
         item["score"] = score
         candidates.append(item)
 
-    candidates.sort(key=lambda item: item["score"], reverse=True)
+    candidates.sort(key=lambda x: x["score"], reverse=True)
     stats["suitable"] = len(candidates)
 
     if candidates:
@@ -554,10 +588,19 @@ def main():
 
     article = None
     for item in candidates:
-        article, status = rewrite_one(item, item["body"])
-        if article:
-            break
-        stats[status] += 1
+        candidate_article, status = rewrite_one(item, item["body"])
+        if not candidate_article:
+            stats[status] += 1
+            continue
+
+        is_dup, dup_reason = check_duplicate(candidate_article, existing)
+        if is_dup:
+            print(f"  Дубль: {candidate_article['title']} ({dup_reason})", flush=True)
+            stats["duplicate_content"] += 1
+            continue
+
+        article = candidate_article
+        break
 
     print("Статистика обработки:", flush=True)
     for key, value in sorted(stats.items()):
