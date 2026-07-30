@@ -1,0 +1,35 @@
+name: Check URL Accessibility
+
+on:
+  workflow_dispatch:  # Запуск вручную
+  schedule:
+    - cron: '0 */6 * * *'  # Или по расписанию (каждые 6 часов)
+
+jobs:
+  check-url:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      
+      - name: Check URL
+        run: |
+          python -c "
+          import requests
+          r = requests.get('https://vsrf.ru/press_center/news/35468/', timeout=30)
+          print(f'Status Code: {r.status_code}')
+          print(f'Content Length: {len(r.text)}')
+          assert r.status_code == 200, f'URL returned status {r.status_code}'
+          print('✅ URL is accessible!')
+          "
