@@ -28,8 +28,8 @@ MAX_BODY_LENGTH = 9000
 COPY_FRAGMENT_WORDS = 12
 
 # Перебор архива ВС РФ по ID статей
-ARCHIVE_START = 35000   # ~ начало 2026 года
-ARCHIVE_END   = 36350   # ~ конец июля 2026 + запас
+ARCHIVE_START = 36100   # ~ начало июля 2026
+ARCHIVE_END   = 36300   # ~ конец июля 2026
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -300,30 +300,30 @@ def fetch_vsrf():
 
     # --- Часть 2: перебор архива по ID ---
     archive_found = 0
-    for article_id in range(ARCHIVE_START, ARCHIVE_END + 1):
-        for pattern in [
-            f"https://vsrf.ru/press_center/news/{article_id}/",
-            f"https://vsrf.ru/documents/all/{article_id}/",
-        ]:
-            key = pattern.lower()
-            if key in seen:
+    total_ids = ARCHIVE_END - ARCHIVE_START + 1
+    for idx, article_id in enumerate(range(ARCHIVE_START, ARCHIVE_END + 1), 1):
+        if idx % 20 == 0:
+            print(f"  Архив: проверено {idx}/{total_ids}, найдено {archive_found}", flush=True)
+        pattern = f"https://vsrf.ru/press_center/news/{article_id}/"
+        key = pattern.lower()
+        if key in seen:
+            continue
+        try:
+            head = requests.head(
+                pattern, headers=HEADERS, timeout=5, allow_redirects=True
+            )
+            if head.status_code != 200:
                 continue
-            try:
-                head = requests.head(
-                    pattern, headers=HEADERS, timeout=8, allow_redirects=True
-                )
-                if head.status_code != 200:
-                    continue
-                seen.add(key)
-                results.append({
-                    "title": f"Материал ВС РФ №{article_id}",
-                    "description": "",
-                    "source_type": "vsrf",
-                    "source_url": pattern,
-                })
-                archive_found += 1
-            except requests.RequestException:
-                continue
+            seen.add(key)
+            results.append({
+                "title": f"Материал ВС РФ №{article_id}",
+                "description": "",
+                "source_type": "vsrf",
+                "source_url": pattern,
+            })
+            archive_found += 1
+        except requests.RequestException:
+            continue
 
     print(
         f"ВС РФ: главная={main_count}, архив={archive_found}, всего={len(results)}",
