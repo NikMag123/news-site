@@ -29,7 +29,6 @@ COPY_FRAGMENT_WORDS = 12
 
 # Перебор архива ВС РФ по ID статей
 ARCHIVE_START = 36100   # ~ начало июля 2026
-ARCHIVE_END   = 36300   # ~ конец июля 2026
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -329,35 +328,49 @@ def fetch_vsrf():
     except requests.RequestException as error:
         print(f"Ошибка загрузки главной ВС РФ: {error}", flush=True)
 
-    # --- Часть 2: перебор архива по ID ---
+    # --- Часть 2: перебор архива с автоопределением верхней границы ---
     archive_found = 0
-    total_ids = ARCHIVE_END - ARCHIVE_START + 1
-    for idx, article_id in enumerate(range(ARCHIVE_START, ARCHIVE_END + 1), 1):
-        if idx % 20 == 0:
-            print(f"  Архив: проверено {idx}/{total_ids}, найдено {archive_found}", flush=True)
+    consecutive_miss = 0
+    article_id = ARCHIVE_START
+    total_checked = 0
+
+    while consecutive_miss < 50:
+        total_checked += 1
+        if total_checked % 20 == 0:
+            print(
+                f"  Архив: проверено {total_checked}, найдено {archive_found}, "
+                f"текущий ID {article_id}",
+                flush=True,
+            )
+
         pattern = f"https://vsrf.ru/press_center/news/{article_id}/"
         key = pattern.lower()
-        if key in seen:
-            continue
-        try:
-            head = requests.head(
-                pattern, headers=HEADERS, timeout=5, allow_redirects=True
-            )
-            if head.status_code != 200:
-                continue
-            seen.add(key)
-            results.append({
-                "title": f"Материал ВС РФ №{article_id}",
-                "description": "",
-                "source_type": "vsrf",
-                "source_url": pattern,
-            })
-            archive_found += 1
-        except requests.RequestException:
-            continue
+
+        if key not in seen:
+            try:
+                head = requests.head(
+                    pattern, headers=HEADERS, timeout=5, allow_redirects=True
+                )
+                if head.status_code == 200:
+                    consecutive_miss = 0
+                    seen.add(key)
+                    results.append({
+                        "title": f"Материал ВС РФ №{article_id}",
+                        "description": "",
+                        "source_type": "vsrf",
+                        "source_url": pattern,
+                    })
+                    archive_found += 1
+                else:
+                    consecutive_miss += 1
+            except requests.RequestException:
+                consecutive_miss += 1
+
+        article_id += 1
 
     print(
-        f"ВС РФ: главная={main_count}, архив={archive_found}, всего={len(results)}",
+        f"ВС РФ: главная={main_count}, архив={archive_found}, "
+        f"всего={len(results)}, верхний ID={article_id - 1}",
         flush=True,
     )
     return results
