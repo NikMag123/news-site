@@ -13,15 +13,23 @@ import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GH_TOKEN = os.getenv("GH_TOKEN")
 REPO = "NikMag123/news-site"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 MAX_NEWS_ON_SITE = 50
 MIN_SCORE = 9
 MIN_BODY_LENGTH = 250
 MAX_BODY_LENGTH = 9000
 COPY_FRAGMENT_WORDS = 12
+
+# Перебор архива ВС РФ по ID статей
+ARCHIVE_START = 35000   # ~ начало 2026 года
+ARCHIVE_END   = 36350   # ~ конец июля 2026 + запас
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -38,9 +46,8 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 # Ключевые слова
 # ---------------------------------------------------------------------------
-
 TOPIC_KEYWORDS = [
-    "недвиж", "квартир", "дом", "жиль", "жил", "земл", "земельн", "участк",
+    "недвиж", "квартир", "дом ", "жиль", "жил ", "земл", "земельн", "участк",
     "кадастр", "росреестр", "ипотек", "аренд", "собственност", "долев",
     "многоквартир", "капремонт", "перепланиров", "разрешение на строительство",
     "строительств", "застройщик", "реконструкц", "новострой", "рынок жилья",
@@ -89,6 +96,7 @@ HARD_BLOCK_HINTS = [
 ]
 
 SOURCE_WEIGHTS = {"vsrf": 4, "pravo": 3}
+
 SOURCE_NAMES = {
     "vsrf": "Верховный Суд Российской Федерации",
     "pravo": "Официальный интернет-портал правовой информации",
@@ -102,11 +110,9 @@ FORBIDDEN_OUTPUT_PATTERNS = [
     r"юридическ(?:ая|ую) консультац", r"следите за изменениями",
 ]
 
-
 # ---------------------------------------------------------------------------
 # Утилиты
 # ---------------------------------------------------------------------------
-
 def clean_text(value):
     return " ".join(unescape(value or "").split()).strip()
 
@@ -139,11 +145,28 @@ def has_long_copied_fragment(source, draft, n=COPY_FRAGMENT_WORDS):
 # ---------------------------------------------------------------------------
 # Загрузка и извлечение текста
 # ---------------------------------------------------------------------------
-
 def source_url_is_article(source_type, url):
     if source_type == "vsrf":
         return bool(re.search(r"/(press_center/news|documents/(all|own))/\d+/?$", url))
     return bool(url)
+
+
+def extract_title_from_html(html):
+    """Извлекает заголовок статьи из HTML (h1 или title)."""
+    soup = BeautifulSoup(html, "html.parser")
+    h1 = soup.find("h1")
+    if h1:
+        title = clean_text(h1.get_text(" ", strip=True))
+        if len(title) >= 15:
+            return title
+    title_tag = soup.find("title")
+    if title_tag:
+        title = clean_text(title_tag.get_text(" ", strip=True))
+        # Убираем суффикс сайта типа "— Верховный Суд Российской Федерации"
+        title = re.sub(r"\s*[—–-]\s*Верховный Суд.*$", "", title)
+        if len(title) >= 15:
+            return title
+    return ""
 
 
 def extract_body_from_html(html, source_type):
@@ -191,18 +214,21 @@ def extract_body_from_html(html, source_type):
 
 
 def fetch_page_body(url, source_type):
+    """Загружает страницу и извлекает тело статьи + заголовок.
+    Возвращает (body, status, real_title)."""
     if not url or not source_url_is_article(source_type, url):
-        return "", "not_article_page"
+        return "", "not_article_page", ""
     try:
         response = requests.get(url, headers=HEADERS, timeout=50)
         response.raise_for_status()
+        real_title = extract_title_from_html(response.text)
         body = extract_body_from_html(response.text, source_type)
         if len(body) < MIN_BODY_LENGTH:
-            return "", "body_too_short"
-        return body[:MAX_BODY_LENGTH], "ok"
+            return "", "body_too_short", real_title
+        return body[:MAX_BODY_LENGTH], "ok", real_title
     except requests.RequestException as error:
         print(f"Ошибка загрузки страницы {url}: {error}", flush=True)
-        return "", "fetch_error"
+        return "", "fetch_error", ""
 
 
 def fetch_rss_items(url, source_type):
@@ -243,24 +269,18 @@ def fetch_pravo():
 
 
 def fetch_vsrf():
-    pages = [
-        "https://vsrf.ru/",
-        "https://vsrf.ru/press_center/news/",
-        "https://vsrf.ru/press_center/news/?structure=press_service",
-    ]
+    """Собирает статьи ВС РФ: главная страница + перебор архива по ID."""
     results = []
     seen = set()
-    for page_url in pages:
-        try:
-            response = requests.get(page_url, headers=HEADERS, timeout=25)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-        except requests.RequestException as error:
-            print(f"Ошибка загрузки ВС РФ {page_url}: {error}", flush=True)
-            continue
 
+    # --- Часть 1: главная страница ---
+    main_count = 0
+    try:
+        response = requests.get("https://vsrf.ru/", headers=HEADERS, timeout=40)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
         for anchor in soup.find_all("a", href=True):
-            source_url = urljoin(page_url, clean_text(unescape(anchor["href"])))
+            source_url = urljoin("https://vsrf.ru/", clean_text(unescape(anchor["href"])))
             if not source_url_is_article("vsrf", source_url):
                 continue
             title = clean_text(anchor.get_text(" ", strip=True))
@@ -274,15 +294,50 @@ def fetch_vsrf():
                 "source_type": "vsrf",
                 "source_url": source_url,
             })
+            main_count += 1
+    except requests.RequestException as error:
+        print(f"Ошибка загрузки главной ВС РФ: {error}", flush=True)
+
+    # --- Часть 2: перебор архива по ID ---
+    archive_found = 0
+    for article_id in range(ARCHIVE_START, ARCHIVE_END + 1):
+        for pattern in [
+            f"https://vsrf.ru/press_center/news/{article_id}/",
+            f"https://vsrf.ru/documents/all/{article_id}/",
+        ]:
+            key = pattern.lower()
+            if key in seen:
+                continue
+            try:
+                head = requests.head(
+                    pattern, headers=HEADERS, timeout=8, allow_redirects=True
+                )
+                if head.status_code != 200:
+                    continue
+                seen.add(key)
+                results.append({
+                    "title": f"Материал ВС РФ №{article_id}",
+                    "description": "",
+                    "source_type": "vsrf",
+                    "source_url": pattern,
+                })
+                archive_found += 1
+            except requests.RequestException:
+                continue
+
+    print(
+        f"ВС РФ: главная={main_count}, архив={archive_found}, всего={len(results)}",
+        flush=True,
+    )
     return results
 
 
 # ---------------------------------------------------------------------------
 # Тематический отбор
 # ---------------------------------------------------------------------------
-
 def classify_item(title, description, body, source_type):
     text = f"{title} {description} {body}".lower()
+
     topic_hits = sum(k in text for k in TOPIC_KEYWORDS)
     context_hits = sum(k in text for k in CONTEXT_KEYWORDS)
     region_hits = sum(k in text for k in REGIONAL_KEYWORDS)
@@ -316,13 +371,13 @@ def classify_item(title, description, body, source_type):
         score -= 2
     if score < MIN_SCORE:
         return False, score, "low_relevance_score"
+
     return True, score, "ok"
 
 
 # ---------------------------------------------------------------------------
 # GitHub
 # ---------------------------------------------------------------------------
-
 def get_existing_news():
     url = f"https://api.github.com/repos/{REPO}/contents/news.json"
     headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
@@ -358,7 +413,6 @@ def save_to_github(news_list):
 # ---------------------------------------------------------------------------
 # Модель
 # ---------------------------------------------------------------------------
-
 def ask_model(messages, temperature=0):
     result = client.chat.completions.create(
         model=MODEL,
@@ -374,6 +428,7 @@ def create_draft(item, body, retry_note=""):
     retry_instruction = f"\nДополнительное требование: {retry_note}\n" if retry_note else ""
     prompt = f"""
 Ты готовишь короткую информационную заметку для российского сайта о недвижимости и строительстве.
+
 Используй ТОЛЬКО факты из исходного материала. Не используй общие знания.
 Не давай рекомендации, прогнозы, оценку выгодности сделки, обещания результата в суде или юридические консультации.
 Не добавляй регионы, даты, цифры, законы, участников спора или последствия, которых нет в материале.
@@ -382,6 +437,7 @@ def create_draft(item, body, retry_note=""):
 Если фактов недостаточно для содержательной заметки, верни approved=false.
 {retry_instruction}
 Исходный заголовок: {item['title']}
+
 Исходный материал:
 {body}
 
@@ -448,6 +504,7 @@ def validate_draft(body, draft):
     title = clean_text(draft.get("title", ""))
     text = clean_text(draft.get("text", ""))
     facts = draft.get("facts", [])
+
     if not draft.get("approved") or not title or not text or not isinstance(facts, list):
         return False, "model_rejected_or_empty"
     if not 3 <= sentence_count(text) <= 10:
@@ -475,7 +532,6 @@ def check_duplicate(article, existing_news):
 
     prompt = f"""
 Ты проверяешь, не дублирует ли новая заметка какую-то из уже опубликованных ПО СУЩЕСТВУ.
-
 Дубль = то же самое дело, спор или событие: те же стороны, те же обстоятельства, та же сумма, тот же предмет спора.
 НЕ дубль = просто похожая тема (например, обе про ЖКХ, но разные дела и разные стороны).
 
@@ -506,9 +562,11 @@ def rewrite_one(item, body):
     try:
         retry_note = ""
         last_status = "model_rejected_or_empty"
+
         for _ in range(4):
             draft = create_draft(item, body, retry_note)
             valid, reason = validate_draft(body, draft)
+
             if not valid:
                 last_status = reason
             else:
@@ -538,6 +596,7 @@ def rewrite_one(item, body):
                 )
             else:
                 break
+
         return None, last_status
     except Exception as error:
         print(f"Ошибка модели для '{item['title']}': {error}", flush=True)
@@ -547,7 +606,6 @@ def rewrite_one(item, body):
 # ---------------------------------------------------------------------------
 # Основной конвейер
 # ---------------------------------------------------------------------------
-
 def main():
     existing = get_existing_news()
     existing_urls = {item.get("source_url", "") for item in existing if item.get("source_url")}
@@ -561,16 +619,23 @@ def main():
         if item["source_url"] in existing_urls:
             stats["already_published"] += 1
             continue
-        body, status = fetch_page_body(item["source_url"], item["source_type"])
+
+        body, status, real_title = fetch_page_body(item["source_url"], item["source_type"])
         if status != "ok":
             stats[status] += 1
             continue
+
+        # Заменяем заголовок-заглушку на реальный (для архивных статей)
+        if real_title and item["title"].startswith("Материал ВС РФ"):
+            item["title"] = real_title
+
         ok, score, reason = classify_item(
             item["title"], item["description"], body, item["source_type"]
         )
         if not ok:
             stats[reason] += 1
             continue
+
         item["body"] = body
         item["score"] = score
         candidates.append(item)
@@ -580,7 +645,7 @@ def main():
 
     if candidates:
         print("Кандидаты после тематического отбора:", flush=True)
-        for item in candidates[:5]:
+        for item in candidates[:10]:
             print(
                 f"  score={item['score']} source={item['source_type']} title={item['title']}",
                 flush=True,
