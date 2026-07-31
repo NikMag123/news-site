@@ -83,6 +83,9 @@ OFF_TOPIC_HINTS = [
     "госслуж", "чиновник", "финансово-хозяйствен",
     "автомобил", "транспорт", "доминирующ",
     "соцвыплат", "военнослужащ", "погибш", "пенсии", "алимент", "развод", "опек",
+    # --- НОВОЕ: уголовные дела ---
+    "оправдан", "подсудим", "приговор", "уголовн дел", "обвиняем",
+    "лишени свобод", "условн срок", "администраци", "глава администраци",
 ]
 
 HARD_OFF_TOPIC_HINTS = [
@@ -152,20 +155,48 @@ def source_url_is_article(source_type, url):
 
 
 def extract_title_from_html(html):
-    """Извлекает заголовок статьи из HTML (h1 или title)."""
+    """Извлекает реальный заголовок статьи из HTML."""
     soup = BeautifulSoup(html, "html.parser")
+
+    # Способ 1: og:title (самый надёжный — всегда содержит заголовок статьи)
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        title = clean_text(og["content"])
+        if len(title) >= 15 and "Официальный сайт" not in title:
+            return title
+
+    # Способ 2: h1 (но не "Официальный сайт...")
     h1 = soup.find("h1")
     if h1:
         title = clean_text(h1.get_text(" ", strip=True))
-        if len(title) >= 15:
+        if len(title) >= 15 and "Официальный сайт" not in title:
             return title
+
+    # Способ 3: h2
+    h2 = soup.find("h2")
+    if h2:
+        title = clean_text(h2.get_text(" ", strip=True))
+        if len(title) >= 15 and "Официальный сайт" not in title:
+            return title
+
+    # Способ 4: div с классом заголовка новости
+    for selector in ["div.news-title", "div.vs-title", "span.news-title",
+                     "div[itemprop='headline']", "h3"]:
+        el = soup.select_one(selector)
+        if el:
+            title = clean_text(el.get_text(" ", strip=True))
+            if len(title) >= 15 and "Официальный сайт" not in title:
+                return title
+
+    # Способ 5: <title> с обрезкой мусора
     title_tag = soup.find("title")
     if title_tag:
         title = clean_text(title_tag.get_text(" ", strip=True))
-        # Убираем суффикс сайта типа "— Верховный Суд Российской Федерации"
         title = re.sub(r"\s*[—–-]\s*Верховный Суд.*$", "", title)
+        title = re.sub(r"^Официальный сайт.*$", "", title)
         if len(title) >= 15:
             return title
+
     return ""
 
 
@@ -531,9 +562,21 @@ def check_duplicate(article, existing_news):
     published_block = "\n".join(published)
 
     prompt = f"""
-Ты проверяешь, не дублирует ли новая заметка какую-то из уже опубликованных ПО СУЩЕСТВУ.
-Дубль = то же самое дело, спор или событие: те же стороны, те же обстоятельства, та же сумма, тот же предмет спора.
-НЕ дубль = просто похожая тема (например, обе про ЖКХ, но разные дела и разные стороны).
+Ты проверяешь, является ли новая заметка ДУБЛЕМ уже опубликованной.
+
+Дубль = ОДНО И ТО ЖЕ конкретное дело/событие: совпадают ВСЕ три признака одновременно:
+  1) Те же стороны (те же истец, ответчик, орган)
+  2) Тот же предмет спора (тот же объект, тот же договор, тот же акт)
+  3) Те же обстоятельства (та же сумма, тот же регион, тот же эпизод)
+
+НЕ дубль (даже если тема похожа):
+- Два разных дела о земельных участках в разных регионах → НЕ дубль
+- Два разных банкротства разных компаний → НЕ дубль
+- Два разных спора о ЖКХ с разными управляющими компаниями → НЕ дубль
+- Дела с похожей правовой квалификацией, но разными сторонами → НЕ дубль
+
+Если сомневаешься — ставь duplicate=false. Лучше опубликовать похожую новость,
+чем пропустить уникальную.
 
 Новая заметка:
 Заголовок: {article['title']}
@@ -543,13 +586,13 @@ def check_duplicate(article, existing_news):
 {published_block}
 
 Верни только JSON:
-{{"duplicate": true, "reason": "какая именно опубликованная новость и почему это то же дело"}}
+{{"duplicate": true, "reason": "конкретно какое дело и почему совпадают все 3 признака"}}
 или
 {{"duplicate": false, "reason": "ok"}}
 """
     try:
         result = ask_model([
-            {"role": "system", "content": "Ты проверяешь дубли. Возвращай только JSON."},
+            {"role": "system", "content": "Ты проверяешь дубли. Дубль = одно и то же дело. Возвращай только JSON."},
             {"role": "user", "content": prompt},
         ])
         return bool(result.get("duplicate")), clean_text(result.get("reason", ""))
