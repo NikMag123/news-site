@@ -21,14 +21,14 @@ GH_TOKEN = os.getenv("GH_TOKEN")
 REPO = "NikMag123/news-site"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-MAX_NEWS_ON_SITE = 50
+MAX_NEWS_ON_SITE = 200
 MIN_SCORE = 9
 MIN_BODY_LENGTH = 250
 MAX_BODY_LENGTH = 9000
 COPY_FRAGMENT_WORDS = 12
 
 # Перебор архива ВС РФ по ID статей
-ARCHIVE_START = 36100   # ~ начало июля 2026
+ARCHIVE_START = 35000   # ~ начало июля 2026
 
 if not OPENAI_API_KEY:
     raise SystemExit("OPENAI_API_KEY is missing")
@@ -81,8 +81,8 @@ OFF_TOPIC_HINTS = [
     "судебн департамент", "организационн обеспеч", "военн суд",
     "госслуж", "чиновник", "финансово-хозяйствен",
     "автомобил", "транспорт", "доминирующ",
-    "соцвыплат", "военнослужащ", "погибш", "пенсии", "алимент", "развод", "опек",      
-    "экстремист", "хакер", "кибер", "террориз", "дтп", "дорожн", "авар",
+    "соцвыплат", "военнослужащ", "погибш", "пенсии", "алимент", "развод", "опек",      "экстремист", "хакер", "кибер", "террориз",
+    "дтп", "дорожн", "авар",
     "потребител", "покупател", "маркетплейс", "товар",
     "международн связ", "звани судьи", "дисциплинарн",
     "поручительств", "кредитн", "заем",
@@ -341,7 +341,7 @@ def fetch_vsrf():
     article_id = ARCHIVE_START
     total_checked = 0
 
-    while consecutive_miss < 50:
+    while consecutive_miss < 100:
         total_checked += 1
         if total_checked % 20 == 0:
             print(
