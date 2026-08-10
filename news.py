@@ -203,7 +203,7 @@ def extract_title_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
     
     # Способ 1: og:title (самый надёжный — всегда содержит заголовок статьи)
-    og = soup.find("meta", property="="og:title")
+    og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         title = clean_text(og["content"])
         if len(title) >= 15 and "Официальный сайт" not in title:
